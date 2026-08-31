@@ -80,6 +80,49 @@ class ValueLadder:
     note: str = ""                # one-line medium technique reminder
 
 
+# --- painting plan (watercolor doc mode) -------------------------------------
+@dataclass(frozen=True)
+class Passage:
+    """One paintable shape in the reference: a region of near-constant colour.
+
+    Coordinates are normalized (0..1) against the working photo so the plan's
+    map can be drawn at any size without carrying the segmentation's own
+    resolution around.
+    """
+
+    id: int                       # 1-based, assigned in painting order
+    target_hex: str               # the passage's mean colour
+    area_frac: float              # share of the whole image, 0..1
+    tier: int                     # value tier, 0 = lightest
+    lstar: float                  # mean L* (drives reserve + ordering)
+    cx: float = 0.0               # centroid, normalized
+    cy: float = 0.0
+    bbox: Tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)  # x0,y0,x1,y1
+    reserved: bool = False        # too light to paint — leave the paper bare
+
+
+@dataclass(frozen=True)
+class WashPass:
+    """One numbered step of the painting plan: a mix, and where it goes."""
+
+    index: int                    # 1-based painting order
+    tier: int
+    passage_ids: Tuple[int, ...]
+    recipe: MixRecipe             # the mix, solved from the artist's palette
+    area_frac: float              # combined share of the image
+    # No paint *names* live here. Like the board's ladders, they are resolved
+    # from the current palette by hex at compose time, so renaming a paint
+    # never invalidates this cached stage.
+    volume_ml: float              # how much wash to mix (generous)
+    volume_text: str              # the same in brush-loads / spoons
+    strength_text: str            # paint-to-water language for this dilution
+    wet: str                      # "wet-on-wet" | "wet-on-dry"
+    technique: str                # one line on how to lay it in
+    edges: str                    # where the edges go soft / stay hard
+    why: str                      # plain-language reason this pass exists
+    tip: str                      # a watercolor lesson attached to this pass
+
+
 # --- JSON helpers (session / presets) ---------------------------------------
 _PAINT_FIELDS = {f.name for f in fields(Paint)}
 _TARGET_FIELDS = {f.name for f in fields(Target)}

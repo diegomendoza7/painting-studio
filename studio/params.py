@@ -23,12 +23,19 @@ CM_PER_INCH = 2.54
 SHADE_MODES = ("auto", "complement", "umber", "black")
 HARMONY_SCHEMES = ("none", "complementary", "analogous", "triadic", "split")
 
+# The two document types. "board" is the palette study sheet; "plan" is the
+# ordered watercolor painting plan for the loaded photo.
+DOC_BOARD = "board"
+DOC_PLAN = "plan"
+DOC_MODES = (DOC_BOARD, DOC_PLAN)
+
 
 @dataclass
 class Params:
     """The complete adjustable state of the palette board."""
 
     # --- document ----------------------------------------------------------
+    doc_mode: str = DOC_BOARD
     medium: str = "oil"
     max_edge: int = 1280            # longest edge of the working photo (px)
 
@@ -62,6 +69,19 @@ class Params:
     show_notes: bool = True
     board_title: str = ""
 
+    # --- painting plan --------------------------------------------------------
+    wash_tiers: int = 4             # value layers, light -> dark (3..6)
+    plan_colors: int = 7            # colour clusters the passages are cut from (3..12)
+    min_passage_pct: float = 1.5    # merge any shape smaller than this % of the image
+    # Paper size drives the wash volumes — non-zero by default so the plan can
+    # answer "how much?" the moment it opens.
+    paper_w: float = 10.0           # in canvas_units
+    paper_h: float = 7.0
+    show_plan_map: bool = True
+    show_plan_passes: bool = True
+    show_plan_tips: bool = True
+    selected_pass: int = -1         # plan highlight only (compose-only)
+
     # --- physical card size (compose-only; drives to-scale export) -----------
     card_w: float = 0.0             # width in canvas_units; 0 = unset (px export)
     canvas_units: str = UNIT_IN
@@ -76,6 +96,12 @@ class Params:
     def copy(self, **changes) -> "Params":
         return replace(self, **changes)
 
+    # The painting plan *is* the watercolor coach, so plan mode always solves
+    # and speaks watercolor whatever the medium selector says. Everything that
+    # branches on the medium reads this, never ``self.medium`` directly.
+    def effective_medium(self) -> str:
+        return "watercolor" if self.doc_mode == DOC_PLAN else self.medium
+
     # Cache keys: each tuple captures *only* the fields a stage depends on,
     # plus the key of the stage above it (chained by the pipeline). Two Params
     # with equal keys for a stage must produce identical output there.
@@ -83,7 +109,17 @@ class Params:
         return (self.max_edge,)
 
     def extract_key(self) -> tuple:
-        return (self.extract_enabled, self.extract_n)
+        # doc_mode belongs here: plan mode skips extraction entirely, so without
+        # it a plan run would poison the cache with an empty result and the next
+        # board run would silently show no targets.
+        return (self.doc_mode, self.extract_enabled, self.extract_n)
+
+    def passage_key(self) -> tuple:
+        # Segmentation is plan-only; in board mode the key collapses to a
+        # constant so switching board settings never re-segments.
+        if self.doc_mode != DOC_PLAN:
+            return (DOC_BOARD,)
+        return (DOC_PLAN, self.wash_tiers, self.plan_colors, round(self.min_passage_pct, 3))
 
     def palette_mix_sig(self) -> tuple:
         # Only what changes a mix's *color math*: hex, whiteness, opacity class.
@@ -92,7 +128,7 @@ class Params:
 
     def solve_key(self) -> tuple:
         return (
-            self.medium,
+            self.effective_medium(),
             self.palette_mix_sig(),
             tuple(t.hex for t in self.manual_targets),
             self.max_paints,
@@ -101,14 +137,22 @@ class Params:
     def ladder_key(self) -> tuple:
         return (self.ladder_steps, self.shade_mode)
 
+    def schedule_key(self) -> tuple:
+        # Paper size only scales the wash volumes, so it re-runs the schedule
+        # but never the segmentation or the solve above it.
+        return (round(self.paper_w, 3), round(self.paper_h, 3), self.canvas_units)
+
 
 # Built-in presets: a sensible starting kit per medium. Each switches the
 # medium *and* loads its starter palette; board/solver style is left alone.
 PRESETS: dict[str, dict] = {
-    "Oil — split primary 8": dict(medium="oil", palette=STARTERS["oil"]),
-    "Watercolor — 12": dict(medium="watercolor", palette=STARTERS["watercolor"]),
-    "Acrylic — basic 6": dict(medium="acrylic", palette=STARTERS["acrylic"]),
-    "Oil pastel — 24": dict(medium="oilpastel", palette=STARTERS["oilpastel"], max_paints=2),
+    "Oil — split primary 8": dict(medium="oil", palette=STARTERS["oil"], doc_mode=DOC_BOARD),
+    "Watercolor — 12": dict(medium="watercolor", palette=STARTERS["watercolor"], doc_mode=DOC_BOARD),
+    "Acrylic — basic 6": dict(medium="acrylic", palette=STARTERS["acrylic"], doc_mode=DOC_BOARD),
+    "Oil pastel — 24": dict(medium="oilpastel", palette=STARTERS["oilpastel"], max_paints=2,
+                            doc_mode=DOC_BOARD),
+    "Watercolor painting plan": dict(medium="watercolor", palette=STARTERS["watercolor"],
+                                     doc_mode=DOC_PLAN),
 }
 
 
@@ -127,6 +171,8 @@ PRESET_FIELDS: tuple[str, ...] = (
     "show_photo", "show_palette", "show_wheel", "show_recipes",
     "show_ladders", "show_value_strip", "show_notes",
     "extract_enabled", "extract_n",
+    "wash_tiers", "plan_colors", "min_passage_pct",
+    "show_plan_map", "show_plan_passes", "show_plan_tips",
 )
 
 

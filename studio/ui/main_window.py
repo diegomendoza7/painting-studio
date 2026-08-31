@@ -27,6 +27,7 @@ from ..models import Target
 from ..palettes import STARTERS
 from ..params import (
     CM_PER_INCH,
+    DOC_PLAN,
     PRESETS,
     UNIT_CM,
     Params,
@@ -163,7 +164,10 @@ class MainWindow(QMainWindow):
         self.progress.setMaximumWidth(220)
         self.progress.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress)
-        self.statusBar().showMessage("Pick a medium, edit your palette, add target colors.")
+        self.statusBar().showMessage(
+            "Edit your palette on the left, then pick a document: a palette board, "
+            "or a watercolor painting plan for a photo."
+        )
 
         # Debounce timer
         self._timer = QTimer(self)
@@ -435,6 +439,17 @@ class MainWindow(QMainWindow):
         if self._result is None:
             return
         layout = self._result.layout
+        # Plan mode: clicking a wash highlights the shapes it covers on the map.
+        for rect, idx in layout.pass_rects:
+            if _in_rect(x, y, rect):
+                sel = -1 if idx == self.params.selected_pass else idx
+                self.params = self.params.copy(selected_pass=sel)
+                self.statusBar().showMessage(
+                    f"Wash {idx + 1} highlighted on the map — click again to clear."
+                    if sel >= 0 else "Highlight cleared."
+                )
+                self._render_now()
+                return
         # Eyedropper: sample the photo region.
         if (
             self.params.eyedropper_mode
@@ -525,9 +540,16 @@ class MainWindow(QMainWindow):
         self.act_pdf.setEnabled(True)
         self.progress.setVisible(False)
         note = ", ".join(result.recomputed) if result.recomputed else "style only"
-        self.statusBar().showMessage(f"Ready — recomputed: {note}")
+        if self.params.doc_mode == DOC_PLAN and not result.passes and not self._path:
+            self.statusBar().showMessage("Open a reference photo to build a painting plan.")
+        else:
+            self.statusBar().showMessage(f"Ready — recomputed: {note}")
         if self._pending:
             self._dispatch()
+
+    # -- naming -------------------------------------------------------------
+    def _doc_stem(self) -> str:
+        return "painting-plan" if self.params.doc_mode == DOC_PLAN else "palette-board"
 
     def _on_failed(self, message: str):
         self._busy = False
@@ -542,7 +564,7 @@ class MainWindow(QMainWindow):
         if not self._result:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export SVG", "palette-board.svg", "SVG (*.svg)")
+            self, "Export SVG", f"{self._doc_stem()}.svg", "SVG (*.svg)")
         if not path:
             return
         try:
@@ -563,7 +585,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export PNG", "palette-board.png", "PNG (*.png)")
+            self, "Export PNG", f"{self._doc_stem()}.png", "PNG (*.png)")
         if not path:
             return
         try:
@@ -590,7 +612,7 @@ class MainWindow(QMainWindow):
         w_in = scene.width * ipp
         h_in = scene.height * ipp
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export PDF", "palette-board.pdf", "PDF (*.pdf)")
+            self, "Export PDF", f"{self._doc_stem()}.pdf", "PDF (*.pdf)")
         if not path:
             return
         try:

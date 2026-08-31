@@ -71,6 +71,7 @@ class BoardLayout:
     swatch_rects: List[Tuple[Rect, int]] = field(default_factory=list)   # (rect, palette idx)
     target_rects: List[Tuple[Rect, int]] = field(default_factory=list)   # (rect, target idx)
     wheel: Optional[Tuple[float, float, float]] = None                   # cx, cy, r
+    pass_rects: List[Tuple[Rect, int]] = field(default_factory=list)     # plan: (rect, pass idx)
 
 
 # --- small geometry helpers ---------------------------------------------------
@@ -148,7 +149,7 @@ def build_board(
     auto_targets: Sequence[Target],
 ) -> Tuple[Scene, BoardLayout]:
     ink = params.ink
-    md = spec(params.medium)
+    md = spec(params.effective_medium())
     names_by_hex = {p.hex: p.name for p in params.palette}
 
     def pname(hex_: str, fallback: str = "?") -> str:

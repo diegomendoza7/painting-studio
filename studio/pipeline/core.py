@@ -4,11 +4,18 @@ Each stage caches its output keyed by *only* the parameters it depends on,
 chained to the key of the stage above it. An eyedropper pick re-solves mixes
 and re-ladders but never re-extracts the photo; toggling a board section is
 compose-only and recomputes nothing; renaming a paint recomputes nothing
-(names are resolved at compose time).
+(names are resolved at compose time); resizing the paper re-costs the washes
+but never re-segments the photo.
 
-Unlike bargue, the pipeline runs happily with *no source image* — the
-artist's palette plus hand-picked targets already make a valid board. The
-photo stages simply no-op until a reference is loaded.
+The app has two documents and they share this one pipeline. In *board* mode
+the targets come from the photo's dominant colours plus whatever the artist
+picked; in *plan* mode they come from the segmented passages, so the same
+solver produces the recipes either way.
+
+Unlike bargue, the pipeline runs happily with *no source image* — the artist's
+palette plus hand-picked targets already make a valid board. The photo stages
+simply no-op until a reference is loaded (a painting plan, which is about a
+specific picture, says so instead).
 """
 from __future__ import annotations
 
@@ -17,12 +24,21 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
-from ..models import MixRecipe, Target, ValueLadder
-from ..params import Params
+from ..models import MixRecipe, Target, ValueLadder, WashPass
+from ..params import DOC_PLAN, Params
 from ..scene import Scene
-from . import board, extract as extract_mod, ladder as ladder_mod, solver
+from . import (
+    board,
+    extract as extract_mod,
+    ladder as ladder_mod,
+    plan_doc,
+    plan_regions,
+    plan_schedule,
+    solver,
+)
 from .board import BoardLayout
 from .loader import LoadedImage, normalize
+from .plan_regions import PassageMap
 
 ProgressCB = Optional[Callable[[str, float], None]]
 
@@ -35,6 +51,8 @@ class Result:
     auto_targets: Tuple[Target, ...]
     recipes: Tuple[MixRecipe, ...]
     ladders: Tuple[ValueLadder, ...]
+    passage_map: Optional[PassageMap] = None
+    passes: Tuple[WashPass, ...] = ()
     recomputed: List[str] = field(default_factory=list)
 
 
@@ -46,8 +64,10 @@ class Pipeline:
         self._raw_token: Optional[tuple] = None
         self._norm = None      # (key, LoadedImage)
         self._extract = None   # (key, Tuple[Target, ...])
+        self._passages = None  # (key, Optional[PassageMap])
         self._solve = None     # (key, Tuple[MixRecipe, ...])
         self._ladder = None    # (key, Tuple[ValueLadder, ...])
+        self._schedule = None  # (key, Tuple[WashPass, ...])
 
     # -- source management --------------------------------------------------
     def set_source(self, loaded: LoadedImage) -> None:
@@ -73,6 +93,7 @@ class Pipeline:
     # -- run ----------------------------------------------------------------
     def run(self, params: Params, progress: ProgressCB = None) -> Result:
         recomputed: List[str] = []
+        is_plan = params.doc_mode == DOC_PLAN
 
         def report(label: str, frac: float) -> None:
             if progress:
@@ -93,29 +114,58 @@ class Pipeline:
                 recomputed.append("normalize")
             rgb = loaded.rgb
 
-        # Stage 1 — extract dominant colors from the photo.
+        # Stage 1 — extract dominant colors from the photo (board targets).
         extract_key = (norm_key, params.extract_key())
 
         def comp_extract() -> Tuple[Target, ...]:
-            if rgb is None or not params.extract_enabled:
+            if rgb is None or not params.extract_enabled or is_plan:
                 return ()
             report("Extracting photo palette", 0.15)
             return extract_mod.extract_targets(rgb, params.extract_n)
 
+        # A stage that no-ops for this document type reports nothing — the
+        # status line should name work that actually happened, so board mode
+        # never mentions "passages" and plan mode never mentions "ladders".
         auto_targets, self._extract, r = self._cached(self._extract, extract_key, comp_extract)
-        if r:
+        if r and not is_plan:
             recomputed.append("extract")
 
-        # Stage 2 — solve mixing recipes for all targets (auto then manual).
-        solve_key = (extract_key, params.solve_key())
+        # Stage 1b — segment the photo into value tiers and paintable passages.
+        passage_key = (norm_key, params.passage_key())
+
+        def comp_passages() -> Optional[PassageMap]:
+            if rgb is None or not is_plan:
+                return None
+            report("Finding passages", 0.20)
+            return plan_regions.build_passages(
+                rgb, params.wash_tiers, params.plan_colors, params.min_passage_pct
+            )
+
+        pmap, self._passages, r = self._cached(self._passages, passage_key, comp_passages)
+        if r and is_plan:
+            recomputed.append("passages")
+
+        # Stage 2 — solve mixing recipes for all targets.
+        #
+        # Plan mode solves the passage colours (index-aligned, so passage i is
+        # recipe i) and appends anything hand-picked; board mode solves the
+        # photo's auto palette plus the picks, as before.
+        solve_key = (extract_key, passage_key, params.solve_key())
 
         def comp_solve() -> Tuple[MixRecipe, ...]:
             manual = tuple(
                 t if t.label else Target(hex=t.hex, label=f"Color {i + 1}", source=t.source)
                 for i, t in enumerate(params.manual_targets)
             )
+            if is_plan:
+                head = tuple(
+                    Target(hex=p.target_hex, label=f"Passage {p.id}", source="auto")
+                    for p in (pmap.passages if pmap else ())
+                )
+            else:
+                head = auto_targets
             return solver.solve_targets(
-                auto_targets + manual, params.palette, params.medium,
+                head + manual, params.palette, params.effective_medium(),
                 params.max_paints, progress=report,
             )
 
@@ -123,23 +173,44 @@ class Pipeline:
         if r:
             recomputed.append("solve")
 
-        # Stage 3 — value ladders.
+        # Stage 3 — value ladders (a board section; the plan has passes instead).
         ladder_key = (solve_key, params.ladder_key())
 
         def comp_ladders() -> Tuple[ValueLadder, ...]:
+            if is_plan:
+                return ()
             report("Building value ladders", 0.85)
             return ladder_mod.build_ladders(
-                recipes, params.palette, params.medium,
+                recipes, params.palette, params.effective_medium(),
                 params.ladder_steps, params.shade_mode,
             )
 
         ladders, self._ladder, r = self._cached(self._ladder, ladder_key, comp_ladders)
-        if r:
+        if r and not is_plan:
             recomputed.append("ladders")
 
-        # Stage 4 — compose (cheap; always rebuilt from cached results + style).
-        report("Composing board", 0.95)
-        scene, layout = board.build_board(params, recipes, ladders, rgb, auto_targets)
+        # Stage 4 — order the passages into wash passes.
+        schedule_key = (solve_key, params.schedule_key())
+
+        def comp_schedule() -> Tuple[WashPass, ...]:
+            if not is_plan or pmap is None:
+                return ()
+            report("Ordering the washes", 0.9)
+            return plan_schedule.build_schedule(
+                pmap.passages, recipes, pmap.adjacency, params.palette,
+                params.paper_w, params.paper_h, params.canvas_units,
+            )
+
+        passes, self._schedule, r = self._cached(self._schedule, schedule_key, comp_schedule)
+        if r and is_plan:
+            recomputed.append("schedule")
+
+        # Stage 5 — compose (cheap; always rebuilt from cached results + style).
+        report("Composing", 0.95)
+        if is_plan:
+            scene, layout = plan_doc.build_plan(params, pmap, recipes, passes, rgb)
+        else:
+            scene, layout = board.build_board(params, recipes, ladders, rgb, auto_targets)
         report("Done", 1.0)
 
         return Result(
@@ -149,5 +220,7 @@ class Pipeline:
             auto_targets=auto_targets,
             recipes=recipes,
             ladders=ladders,
+            passage_map=pmap,
+            passes=passes,
             recomputed=recomputed,
         )

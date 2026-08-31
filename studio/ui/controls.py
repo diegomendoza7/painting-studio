@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
 from ..media import SPECS
 from ..params import (
     CM_PER_INCH,
+    DOC_BOARD,
+    DOC_PLAN,
     HARMONY_SCHEMES,
     PRESETS,
     SHADE_MODES,
@@ -125,6 +127,20 @@ class ControlsPanel(QWidget):
         prow.setLayout(preset_row)
         root.addWidget(prow)
 
+        # --- Document type -------------------------------------------------------
+        g_doc = QGroupBox("Document")
+        f = self._form(g_doc)
+        self.doc_mode = QComboBox()
+        self.doc_mode.addItem("Palette board", DOC_BOARD)
+        self.doc_mode.addItem("Watercolor painting plan", DOC_PLAN)
+        self._set_combo_data(self.doc_mode, params.doc_mode)
+        self.doc_mode.setToolTip(
+            "Palette board: a reference sheet of your colours.\n"
+            "Painting plan: numbered washes for the photo you loaded."
+        )
+        f.addRow("Type", self.doc_mode)
+        root.addWidget(g_doc)
+
         # --- Medium ------------------------------------------------------------
         g_medium = QGroupBox("Medium")
         f = self._form(g_medium)
@@ -139,6 +155,55 @@ class ControlsPanel(QWidget):
         f.addRow(self.medium_rule)
         root.addWidget(g_medium)
         self._update_medium_rule()
+
+        # --- Painting plan (plan mode only) ----------------------------------------
+        g_plan = QGroupBox("Painting plan")
+        f = self._form(g_plan)
+        self.wash_tiers = QSpinBox()
+        self.wash_tiers.setRange(3, 6)
+        self.wash_tiers.setValue(params.wash_tiers)
+        self.wash_tiers.setToolTip("How many value layers the painting is built from.")
+        self.plan_colors = QSpinBox()
+        self.plan_colors.setRange(3, 12)
+        self.plan_colors.setValue(params.plan_colors)
+        self.plan_colors.setToolTip("How finely the photo is cut into colour areas.")
+        self.min_passage = QDoubleSpinBox()
+        self.min_passage.setRange(0.2, 8.0)
+        self.min_passage.setDecimals(1)
+        self.min_passage.setSingleStep(0.5)
+        self.min_passage.setSuffix(" %")
+        self.min_passage.setValue(params.min_passage_pct)
+        self.min_passage.setToolTip(
+            "Shapes smaller than this share of the picture get folded into their neighbour."
+        )
+        paper_row = QHBoxLayout()
+        self.paper_w = QDoubleSpinBox()
+        self.paper_h = QDoubleSpinBox()
+        for sb, v in ((self.paper_w, params.paper_w), (self.paper_h, params.paper_h)):
+            sb.setRange(0.0, 200.0)
+            sb.setDecimals(1)
+            sb.setSingleStep(0.5)
+            sb.setValue(v)
+            sb.setToolTip("Your paper size — this is what turns area into millilitres of wash.")
+            paper_row.addWidget(sb)
+        pprow = QWidget()
+        pprow.setLayout(paper_row)
+        self.show_plan_map = QCheckBox("Map & value plan")
+        self.show_plan_passes = QCheckBox("The washes")
+        self.show_plan_tips = QCheckBox("Test strip & glossary")
+        for cb, v in (
+            (self.show_plan_map, params.show_plan_map),
+            (self.show_plan_passes, params.show_plan_passes),
+            (self.show_plan_tips, params.show_plan_tips),
+        ):
+            cb.setChecked(v)
+        f.addRow("Value tiers", self.wash_tiers)
+        f.addRow("Colour areas", self.plan_colors)
+        f.addRow("Smallest shape", self.min_passage)
+        f.addRow("Paper W × H", pprow)
+        for cb in (self.show_plan_map, self.show_plan_passes, self.show_plan_tips):
+            f.addRow(cb)
+        root.addWidget(g_plan)
 
         # --- Targets --------------------------------------------------------------
         g_targets = QGroupBox("Target colors")
@@ -260,8 +325,18 @@ class ControlsPanel(QWidget):
         f.addRow("Units", self.card_units)
         root.addWidget(g_card)
 
+        # The two documents want different controls; keep both built and just
+        # show the relevant set, so collect()/apply() stay mode-agnostic.
+        self._g_plan = g_plan
+        self._g_medium = g_medium
+        self._g_targets = g_targets
+        self._g_ladder = g_ladder
+        self._g_wheel = g_wheel
+        self._g_board = g_board
+
         root.addStretch(1)
         self._wire()
+        self._sync_mode()
 
     # -- helpers ------------------------------------------------------------------
     @staticmethod
@@ -286,22 +361,41 @@ class ControlsPanel(QWidget):
             self.anchor_btn.setText("auto")
 
     def _update_medium_rule(self):
-        sp = SPECS[self.medium.currentData()]
-        self.medium_rule.setText(f"{sp.lighten} {sp.darken}")
+        if self.doc_mode.currentData() == DOC_PLAN:
+            sp = SPECS["watercolor"]
+            self.medium_rule.setText(
+                "The painting plan is watercolor — the paper is your white, and "
+                "everything lightens by dilution."
+            )
+        else:
+            sp = SPECS[self.medium.currentData()]
+            self.medium_rule.setText(f"{sp.lighten} {sp.darken}")
+
+    def _sync_mode(self):
+        """Show only the controls the current document actually uses."""
+        plan = self.doc_mode.currentData() == DOC_PLAN
+        self._g_plan.setVisible(plan)
+        self.medium.setEnabled(not plan)      # plan mode is always watercolor
+        for box in (self._g_targets, self._g_ladder, self._g_wheel, self._g_board):
+            box.setVisible(not plan)
+        self._update_medium_rule()
 
     # -- signal wiring ------------------------------------------------------------
     def _wire(self):
-        for combo in (self.medium, self.max_paints, self.shade_mode, self.harmony, self.card_units):
+        for combo in (self.doc_mode, self.medium, self.max_paints, self.shade_mode,
+                      self.harmony, self.card_units):
             combo.currentIndexChanged.connect(self._emit)
         self.medium.currentIndexChanged.connect(self._update_medium_rule)
+        self.doc_mode.currentIndexChanged.connect(self._sync_mode)
         self.card_units.currentIndexChanged.connect(self._on_units_changed)
-        for sb in (self.extract_n, self.ladder_steps):
+        for sb in (self.extract_n, self.ladder_steps, self.wash_tiers, self.plan_colors):
             sb.valueChanged.connect(self._emit)
-        self.card_w.valueChanged.connect(self._emit)
+        for sb in (self.card_w, self.min_passage, self.paper_w, self.paper_h):
+            sb.valueChanged.connect(self._emit)
         for cb in (
             self.extract_enabled, self.show_gamut, self.show_photo, self.show_palette,
             self.show_wheel, self.show_value_strip, self.show_recipes, self.show_ladders,
-            self.show_notes,
+            self.show_notes, self.show_plan_map, self.show_plan_passes, self.show_plan_tips,
         ):
             cb.toggled.connect(self._emit)
         self.board_title.textEdited.connect(self._emit)
@@ -344,12 +438,14 @@ class ControlsPanel(QWidget):
         new = self.card_units.currentData()
         if new == self._card_unit:
             return
-        v = self.card_w.value()
-        if v > 0:
-            v = v * CM_PER_INCH if new == UNIT_CM else v / CM_PER_INCH
-            self.card_w.blockSignals(True)
-            self.card_w.setValue(v)
-            self.card_w.blockSignals(False)
+        # Card width and paper size are both in these units, so both convert.
+        for sb in (self.card_w, self.paper_w, self.paper_h):
+            v = sb.value()
+            if v > 0:
+                v = v * CM_PER_INCH if new == UNIT_CM else v / CM_PER_INCH
+                sb.blockSignals(True)
+                sb.setValue(v)
+                sb.blockSignals(False)
         self._card_unit = new
         # _emit already fired from currentIndexChanged.
 
@@ -372,7 +468,16 @@ class ControlsPanel(QWidget):
     # -- params <-> widgets --------------------------------------------------------
     def collect(self, base: Params) -> Params:
         return base.copy(
+            doc_mode=self.doc_mode.currentData(),
             medium=self.medium.currentData(),
+            wash_tiers=int(self.wash_tiers.value()),
+            plan_colors=int(self.plan_colors.value()),
+            min_passage_pct=float(self.min_passage.value()),
+            paper_w=float(self.paper_w.value()),
+            paper_h=float(self.paper_h.value()),
+            show_plan_map=self.show_plan_map.isChecked(),
+            show_plan_passes=self.show_plan_passes.isChecked(),
+            show_plan_tips=self.show_plan_tips.isChecked(),
             extract_enabled=self.extract_enabled.isChecked(),
             extract_n=int(self.extract_n.value()),
             max_paints=int(self.max_paints.currentData()),
@@ -395,8 +500,17 @@ class ControlsPanel(QWidget):
 
     def apply(self, p: Params):
         self._loading = True
+        self._set_combo_data(self.doc_mode, p.doc_mode)
         self._set_combo_data(self.medium, p.medium)
-        self._update_medium_rule()
+        self.wash_tiers.setValue(p.wash_tiers)
+        self.plan_colors.setValue(p.plan_colors)
+        self.min_passage.setValue(p.min_passage_pct)
+        self.paper_w.setValue(p.paper_w)
+        self.paper_h.setValue(p.paper_h)
+        self.show_plan_map.setChecked(p.show_plan_map)
+        self.show_plan_passes.setChecked(p.show_plan_passes)
+        self.show_plan_tips.setChecked(p.show_plan_tips)
+        self._sync_mode()
         self.extract_enabled.setChecked(p.extract_enabled)
         self.extract_n.setValue(p.extract_n)
         self._set_combo_data(self.max_paints, p.max_paints)

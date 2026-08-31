@@ -23,11 +23,12 @@ from studio import color  # noqa: E402
 from studio import mixer  # noqa: E402
 from studio.models import Paint, Target  # noqa: E402
 from studio.palettes import ACRYLIC_STARTER, OIL_STARTER, OILPASTEL_STARTER, WATERCOLOR_STARTER  # noqa: E402
-from studio.params import PRESET_FIELDS, PRESETS, Params, apply_preset, apply_preset_values, preset_to_dict  # noqa: E402
+from studio.params import DOC_BOARD, DOC_PLAN, PRESET_FIELDS, PRESETS, Params, apply_preset, apply_preset_values, preset_to_dict  # noqa: E402
 from studio.pipeline import Pipeline  # noqa: E402
 from studio.pipeline.loader import LoadedImage, load  # noqa: E402
 from studio.pipeline.solver import ACHIEVABLE_DE, solve_targets  # noqa: E402
-from studio.scene import ALL_LAYERS, LAYER_RECIPES, LAYER_WHEEL  # noqa: E402
+from studio.pipeline import plan_regions, plan_schedule  # noqa: E402
+from studio.scene import ALL_LAYERS, LAYER_PLAN_MAP, LAYER_PLAN_PASSES, LAYER_RECIPES, LAYER_WHEEL, PLAN_LAYERS  # noqa: E402
 from studio.svg import scene_to_svg  # noqa: E402
 
 PASS, FAIL = "PASS", "FAIL"
@@ -53,6 +54,34 @@ def make_still_life(h: int = 360, w: int = 480) -> np.ndarray:
     img[h // 2 :, w // 2 :] = PATCHES[3]
     img += rng.integers(-4, 5, img.shape, dtype=np.int16)
     return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# A high-key "landscape": a near-white sky, two mid masses and a dark, in
+# nested horizontal bands, so the plan's tiers and ordering are predictable.
+PLAN_BANDS = [(238, 236, 230), (152, 176, 206), (188, 150, 92), (52, 58, 44)]
+
+
+def make_plan_scene(h: int = 300, w: int = 400) -> np.ndarray:
+    rng = np.random.default_rng(3)
+    img = np.zeros((h, w, 3), np.int16)
+    for i, band in enumerate(PLAN_BANDS):
+        img[i * h // 4 : (i + 1) * h // 4] = band
+    img += rng.integers(-3, 4, img.shape, dtype=np.int16)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def plan_params(**kw) -> Params:
+    base = dict(doc_mode=DOC_PLAN, palette=WATERCOLOR_STARTER)
+    base.update(kw)
+    return Params(**base)
+
+
+def run_plan(img=None, **kw):
+    pipe = Pipeline()
+    pipe.set_source(LoadedImage(rgb=img if img is not None else make_plan_scene(),
+                                source_path="synthetic"))
+    p = plan_params(**kw)
+    return pipe, p, pipe.run(p)
 
 
 def group1_color_math():
@@ -546,9 +575,266 @@ def group17_ui_smoke():
     win._do_undo()
     check(len(win.params.manual_targets) == n_before, "undo removes the eyedropped target")
 
+    # --- painting plan through the real window --------------------------------
+    plan_p = Params(doc_mode=DOC_PLAN, palette=WATERCOLOR_STARTER, wash_tiers=5,
+                    plan_colors=9, min_passage_pct=2.5, paper_w=15.0, paper_h=11.0,
+                    show_plan_tips=False)
+    plan_panel = ControlsPanel(plan_p)
+    plan_panel.apply(plan_p)
+    check(plan_panel.collect(plan_p) == plan_p, "controls round-trip the plan fields")
+    check(not plan_panel.medium.isEnabled(), "plan mode locks the medium to watercolor")
+    check(not plan_panel._g_plan.isHidden(), "plan mode shows the plan controls")
+    check(plan_panel._g_ladder.isHidden() and plan_panel._g_wheel.isHidden()
+          and plan_panel._g_board.isHidden(), "plan mode hides the board-only controls")
+    plan_panel.apply(Params())
+    check(plan_panel.medium.isEnabled(), "board mode unlocks the medium again")
+    check(plan_panel._g_plan.isHidden(), "board mode hides the plan controls")
+    check(not plan_panel._g_board.isHidden(), "board mode shows the board controls")
+
+    # Switch the live window into plan mode via the panel, as a user would.
+    win.params = win.params.copy(palette=WATERCOLOR_STARTER)
+    win.controls.apply(win.params.copy(doc_mode=DOC_PLAN))
+    win._on_controls_changed()
+    win._render_now()
+    deadline = time.monotonic() + 30.0
+    while (win._busy or win._pending or win._timer.isActive()
+           or win._result is None or win._result.passage_map is None) and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    check(win.params.doc_mode == DOC_PLAN, "the window switched to plan mode")
+    check(win._result is not None and win._result.passage_map is not None,
+          "the window renders a painting plan")
+    check(len(win._result.passes) >= 1, "the rendered plan has washes")
+    check(len(win._result.layout.pass_rects) == len(win._result.passes),
+          "the plan layout exposes a rect per wash")
+    # Clicking a wash row highlights it; clicking again clears it.
+    (prx, pry, prw, prh), pidx = win._result.layout.pass_rects[0]
+    win._on_preview_click(prx + prw / 2, pry + prh / 2, 0)
+    check(win.params.selected_pass == pidx, "clicking a wash selects it")
+    win._on_preview_click(prx + prw / 2, pry + prh / 2, 0)
+    check(win.params.selected_pass == -1, "clicking the same wash again clears the highlight")
+    check(win._doc_stem() == "painting-plan", "exports are named for the plan")
+
     win._thread.quit()
     win._thread.wait(3000)
     QSettings().clear()
+
+
+def group18_plan_segmentation():
+    print("\n[18] Painting plan — value tiers & passages")
+    _pipe, _p, res = run_plan()
+    pm = res.passage_map
+    check(pm is not None, "plan mode produces a passage map")
+    check(len(pm.tier_fracs) == 4, f"wash_tiers tiers reported (got {len(pm.tier_fracs)})")
+    check(abs(sum(pm.tier_fracs) - 1.0) < 1e-6, "tier area fractions sum to 1")
+    check(all(pm.tier_centers[i] >= pm.tier_centers[i + 1] for i in range(len(pm.tier_centers) - 1)),
+          "tier centers run lightest -> darkest")
+    # Four flat bands must not shatter into dozens of passages.
+    check(4 <= len(pm.passages) <= 8,
+          f"four flat bands give a handful of passages (got {len(pm.passages)})")
+    check(abs(sum(p.area_frac for p in pm.passages) - 1.0) < 1e-6,
+          "passage areas cover the whole image")
+    check([p.id for p in pm.passages] == list(range(1, len(pm.passages) + 1)),
+          "passages are numbered 1..n in painting order")
+    ls = [p.lstar for p in pm.passages]
+    check(all(pm.passages[i].tier <= pm.passages[i + 1].tier for i in range(len(ls) - 1)),
+          "passage numbering follows the value tiers")
+    # The near-white band is reserved; the dark band never is.
+    top = max(pm.passages, key=lambda p: p.lstar)
+    bottom = min(pm.passages, key=lambda p: p.lstar)
+    check(top.reserved, f"the near-white band is reserved (L* {top.lstar:.0f})")
+    check(not bottom.reserved, f"the dark band is painted, not reserved (L* {bottom.lstar:.0f})")
+    # Every label indexes a real passage, and each passage owns some pixels.
+    check(int(pm.labels.min()) == 0 and int(pm.labels.max()) == len(pm.passages) - 1,
+          "label image indexes exactly the passage list")
+    check(len(np.unique(pm.labels)) == len(pm.passages), "every passage owns pixels")
+    # Centroid labels land inside their own shape (concave shapes included).
+    h, w = pm.labels.shape
+    inside = all(
+        pm.labels[min(h - 1, int(p.cy * h)), min(w - 1, int(p.cx * w))] == i
+        for i, p in enumerate(pm.passages)
+    )
+    check(inside, "each passage's number sits inside its own shape")
+    # Adjacency is symmetric.
+    sym = all(
+        a in pm.adjacency.get(b, {}) and pm.adjacency[b][a] == n
+        for a, nbrs in pm.adjacency.items() for b, n in nbrs.items()
+    )
+    check(sym, "passage adjacency is symmetric")
+    # Determinism, and a coarser threshold gives no more shapes.
+    _p2, _q2, res2 = run_plan()
+    check([p.target_hex for p in res2.passage_map.passages]
+          == [p.target_hex for p in pm.passages], "segmentation is deterministic")
+    _p3, _q3, res3 = run_plan(min_passage_pct=6.0)
+    check(len(res3.passage_map.passages) <= len(pm.passages),
+          "a coarser smallest-shape setting never adds passages")
+    check(len(res.passage_map.passages) <= plan_regions.MAX_PASSAGES,
+          "passage count is capped")
+
+
+def group19_plan_schedule():
+    print("\n[19] Painting plan — wash schedule")
+    _pipe, p, res = run_plan()
+    passes = res.passes
+    check(len(passes) >= 2, f"the schedule has several washes (got {len(passes)})")
+    check([w.index for w in passes] == list(range(1, len(passes) + 1)),
+          "washes are numbered 1..n")
+    # The load-bearing invariant: no wash ever goes down over a darker one.
+    by_id = {p_.id: p_ for p_ in res.passage_map.passages}
+
+    def mean_l(w):
+        tot = sum(by_id[i].area_frac for i in w.passage_ids)
+        return sum(by_id[i].lstar * by_id[i].area_frac for i in w.passage_ids) / tot
+
+    lums = [mean_l(w) for w in passes]
+    check(all(lums[i] >= lums[i + 1] - 1e-9 for i in range(len(lums) - 1)),
+          f"washes run strictly light -> dark ({[f'{v:.0f}' for v in lums]})")
+    # Reserved shapes are never scheduled; painted ones are scheduled once.
+    scheduled = [i for w in passes for i in w.passage_ids]
+    reserved = {p_.id for p_ in res.passage_map.passages if p_.reserved}
+    check(not (set(scheduled) & reserved), "reserved whites are never painted")
+    check(len(scheduled) == len(set(scheduled)), "each passage is painted in exactly one wash")
+    check(set(scheduled) | reserved == {p_.id for p_ in res.passage_map.passages},
+          "every passage is either painted or reserved")
+    check(all(w.recipe.dilution > 0 for w in passes), "every wash carries a dilution")
+    check(all(w.volume_ml >= plan_schedule.MIN_ML for w in passes),
+          "every wash gets a mixable volume")
+    check(all("brush-load" in w.volume_text for w in passes), "volumes speak in brush-loads")
+    check(all(w.why and w.tip for w in passes), "every wash explains itself and teaches something")
+    check(len({w.tip for w in passes}) == len(passes), "wash tips do not repeat")
+    check(passes[-1].recipe.dilution >= passes[0].recipe.dilution,
+          "the darks are mixed stronger than the underwash")
+
+    # Parts arithmetic: whole numbers that track the solved weights.
+    check(plan_schedule.mix_parts([1.0]) == (1,), "a single paint is one part")
+    check(plan_schedule.mix_parts([0.5, 0.5]) == (1, 1), "an even mix is 1:1")
+    check(plan_schedule.mix_parts([0.75, 0.25]) == (3, 1), "0.75/0.25 reads as 3:1")
+    check(plan_schedule.mix_parts([0.66, 0.34]) == (2, 1), "0.66/0.34 reads as 2:1")
+    for w in passes:
+        parts = plan_schedule.mix_parts([s.weight for s in w.recipe.steps])
+        check(len(parts) == len(w.recipe.steps) and all(v >= 1 for v in parts),
+              f"wash {w.index} parts are whole and complete ({parts})")
+        biggest = max(range(len(w.recipe.steps)), key=lambda i: w.recipe.steps[i].weight)
+        check(parts[biggest] == max(parts),
+              f"wash {w.index} gives the dominant paint the most parts")
+
+    # Volume tracks paper area, and only paper area.
+    area = plan_schedule.paper_area_cm2(10.0, 7.0, "in")
+    check(abs(area - 10 * 7 * 2.54 ** 2) < 1e-6, "paper area converts inches to cm²")
+    check(abs(plan_schedule.paper_area_cm2(20.0, 30.0, "cm") - 600.0) < 1e-6,
+          "paper area in cm is used as-is")
+    small = plan_schedule.wash_volume_ml(0.5, area, False)
+    big = plan_schedule.wash_volume_ml(0.5, area * 4, False)
+    check(big > small, "a bigger sheet needs more wash")
+    check(plan_schedule.wash_volume_ml(0.5, area, True)
+          > plan_schedule.wash_volume_ml(0.5, area, False),
+          "wetting the paper first costs extra volume")
+    check(plan_schedule.wash_volume_ml(0.0001, area, False) == plan_schedule.MIN_ML,
+          "a tiny shape still gets a mixable minimum")
+    check(plan_schedule.wash_volume_ml(0.5, 0.0, False) == 0.0,
+          "no paper size means no invented volume")
+    check("set a paper size" in plan_schedule.volume_text(0.0),
+          "a missing paper size says so instead of printing 0 ml")
+
+    # Edge language reflects what is actually adjacent.
+    joined = " ".join(w.edges for w in passes)
+    check("already dry" in joined, "later washes are told which neighbours are dry")
+    if reserved:
+        check("bare paper" in joined, "washes touching a reserved white are warned off it")
+
+
+def group20_plan_document():
+    print("\n[20] Painting plan — document")
+    _pipe, p, res = run_plan()
+    scene = res.scene
+    names = [ly.name for ly in scene.layers]
+    check(names == list(PLAN_LAYERS), f"plan layers present in order (got {names})")
+    check(scene.height > 600, "the plan is a full document")
+    # Reference photo + big map + one mini-map per wash.
+    check(len(scene.patches) == 2 + len(res.passes),
+          f"photo, map and one mini-map per wash (got {len(scene.patches)})")
+    check(res.layout.photo_rect is not None, "the plan exposes a photo rect for the eyedropper")
+    check(len(res.layout.pass_rects) == len(res.passes), "every wash is clickable")
+    rects = [r for r, _i in res.layout.pass_rects]
+    check(all(rects[i][1] < rects[i + 1][1] for i in range(len(rects) - 1)),
+          "wash rows do not overlap")
+    # Section toggles are compose-only.
+    _pp, _qq, res_off = run_plan(show_plan_tips=False)
+    check(res_off.scene.height < scene.height, "turning off a section shortens the plan")
+    check(res_off.passes == res.passes, "a section toggle does not disturb the schedule")
+    # Selecting a wash highlights it without changing the plan.
+    _ps, _qs, res_sel = run_plan(selected_pass=0)
+    sel_layer = res_sel.scene.layer(LAYER_PLAN_PASSES)
+    base_layer = scene.layer(LAYER_PLAN_PASSES)
+    check(len(sel_layer.strokes) == len(base_layer.strokes) + 1,
+          "selecting a wash draws exactly one highlight")
+    check(res_sel.passes == res.passes, "selection never changes the schedule")
+    # Generated sentences stay inside the page.
+    for ly in res.scene.layers:
+        for t in ly.texts:
+            width = len(t.text) * t.size * 0.62
+            end = t.x + (width if t.anchor == "start" else width / 2.0)
+            check(end <= scene.width + 1, f"text stays on the page ({t.text[:34]!r})")
+            break   # one representative line per layer keeps the log readable
+    longest = max(
+        (t for ly in res.scene.layers for t in ly.texts),
+        key=lambda t: len(t.text) * t.size,
+    )
+    check(longest.x + len(longest.text) * longest.size * 0.62 <= scene.width + 1,
+          f"the longest generated line is clipped to the page ({len(longest.text)} chars)")
+    # SVG carries the map rasters and the Mixbox attribution.
+    svg = scene_to_svg(scene)
+    check(svg.count("<image") == len(scene.patches), "every map raster is embedded in the SVG")
+    check("CC BY-NC" in svg, "the plan carries the Mixbox attribution")
+    for name in PLAN_LAYERS:
+        check(f'inkscape:label="{name}"' in svg, f"SVG has the {name} layer")
+    # With no photo the plan says what to do instead of failing.
+    empty = Pipeline().run(plan_params())
+    check(empty.passage_map is None and empty.passes == (), "no photo means no plan")
+    head = " ".join(t.text for t in empty.scene.layer("header").texts)
+    check("reference photo" in head, "the empty plan asks for a photo")
+
+
+def group21_plan_cache():
+    print("\n[21] Painting plan — caching & mode switching")
+    pipe, p, _res = run_plan()
+    check(pipe.run(p).recomputed == [], "a repeat plan run recomputes nothing")
+    # Paper size only re-costs the washes.
+    p2 = p.copy(paper_h=14.0)
+    check(pipe.run(p2).recomputed == ["schedule"], "paper size only re-runs the schedule")
+    v_small = pipe.run(p).passes[0].volume_ml
+    v_big = pipe.run(p2).passes[0].volume_ml
+    check(v_big > v_small, "a bigger sheet asks for more wash")
+    # Segmentation settings re-segment and everything below.
+    check(pipe.run(p.copy(plan_colors=5)).recomputed == ["passages", "solve", "schedule"],
+          "colour-area count re-segments")
+    check(pipe.run(p.copy(wash_tiers=5)).recomputed == ["passages", "solve", "schedule"],
+          "tier count re-segments")
+    # Renaming a paint is still free, and still reaches the printed plan.
+    pipe.run(p)                     # back to the baseline settings
+    first = _res.passes[0].recipe.steps[0]
+    renamed = tuple(
+        Paint(name="Renamed Ochre", hex=q.hex, is_white=q.is_white, opacity=q.opacity,
+              staining=q.staining, granulating=q.granulating)
+        if q.hex == first.paint_hex else q
+        for q in p.palette
+    )
+    res_r = pipe.run(p.copy(palette=renamed))
+    check(res_r.recomputed == [], "renaming a paint recomputes nothing in plan mode")
+    printed = " ".join(t.text for t in res_r.scene.layer(LAYER_PLAN_PASSES).texts)
+    check("Renamed Ochre" in printed, "a renamed paint still reaches the printed washes")
+    check(pipe.run(p.copy(show_plan_map=False)).recomputed == [], "section toggles are compose-only")
+    # Board mode never reports plan stages, and vice versa.
+    board = pipe.run(p.copy(doc_mode=DOC_BOARD))
+    check("passages" not in board.recomputed and "schedule" not in board.recomputed,
+          f"board mode never mentions plan stages (got {board.recomputed})")
+    check("ladders" not in pipe.run(p).recomputed, "plan mode never mentions ladders")
+    # Regression: a plan run must not poison the board's photo extraction.
+    check(len(board.recipes) > 0 and len(board.auto_targets) > 0,
+          "board mode still extracts photo targets after a plan run")
+    plan_again = pipe.run(p)
+    check(plan_again.passage_map is not None and len(plan_again.passes) == len(_res.passes),
+          "switching back to the plan restores it unchanged")
 
 
 def main() -> int:
@@ -569,6 +855,10 @@ def main() -> int:
     group15_session_roundtrip()
     group16_presets()
     group17_ui_smoke()
+    group18_plan_segmentation()
+    group19_plan_schedule()
+    group20_plan_document()
+    group21_plan_cache()
 
     print(f"\n{'=' * 60}")
     if _failures:

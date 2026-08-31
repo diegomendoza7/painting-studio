@@ -33,6 +33,22 @@ ALL_LAYERS = (
     LAYER_NOTES,
 )
 
+# Painting-plan document layers (the plan is a different document, so it has
+# its own layer set rather than reusing the board's).
+LAYER_PLAN_RULES = "plan-rules"
+LAYER_PLAN_MAP = "plan-map"
+LAYER_PLAN_PASSES = "plan-passes"
+LAYER_PLAN_TIPS = "plan-tips"
+
+PLAN_LAYERS = (
+    LAYER_HEADER,
+    LAYER_PLAN_RULES,
+    LAYER_PLAN_MAP,
+    LAYER_PLAN_PASSES,
+    LAYER_PLAN_TIPS,
+    LAYER_NOTES,
+)
+
 
 @dataclass
 class Stroke:

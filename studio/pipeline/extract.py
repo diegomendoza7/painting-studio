@@ -17,8 +17,12 @@ _MAX_SAMPLES = 20000
 _MAX_ITER = 25
 
 
-def _kmeans(samples: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Seeded k-means++ over (N,3) float samples -> (centers (k,3), labels (N,))."""
+def kmeans(samples: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Seeded k-means++ over (N,3) float samples -> (centers (k,3), labels (N,)).
+
+    Shared with the painting-plan segmentation, which clusters the same way
+    before cutting the clusters into connected shapes.
+    """
     rng = np.random.default_rng(_SEED)
     n = samples.shape[0]
     # k-means++ init.
@@ -54,7 +58,7 @@ def extract_targets(rgb: np.ndarray, n: int) -> tuple[Target, ...]:
     stride = max(1, len(pixels) // _MAX_SAMPLES)
     samples = rgb_to_lab(pixels[::stride].astype(np.float64))
     k = min(n, len(samples))
-    centers, labels = _kmeans(samples, k)
+    centers, labels = kmeans(samples, k)
     counts = np.bincount(labels, minlength=k)
     order = sorted(range(k), key=lambda i: (-counts[i], centers[i][0]))
     out = []
