@@ -5,9 +5,10 @@ technique for **watercolor, acrylic, oil, and oil pastel**. Sibling of the
 Bargue Block-In app: where that one handles drawing and proportion, this one
 handles color.
 
-It makes two documents from the same palette and the same photo: a **palette
-board** (a reference sheet of your colours) and a **watercolor painting plan**
-(numbered instructions for painting one specific picture). Pick which under
+It makes three documents from the same palette and the same photo: a **palette
+board** (a reference sheet of your colours), a **watercolor painting plan**
+(numbered instructions for painting one specific picture), and a **mosaic
+guide** (the photo as tesserae, painted one square at a time). Pick which under
 *Document* in the right-hand panel.
 
 ## Palette board
@@ -60,6 +61,48 @@ picture" into "mix about 11 ml". Volumes are deliberately generous — a wash
 re-mixed halfway through never matches. Click any wash to highlight its shapes
 on the map.
 
+## Mosaic guide
+
+Roman/Byzantine mosaic as a beginner's watercolor exercise. The photo is cut
+into tesserae and reduced to a small stock of colours, and each tessera is one
+flat square of paint — no edges to control, no wet-in-wet timing, and the grout
+is just bare paper you leave between the squares.
+
+- **Andamento — courses that follow the drawing.** The tesserae are not on a
+  lattice. The picture's broad value masses are found first, a distance field is
+  grown *inside* each of them, and the stones are marched along its level sets,
+  so a course hugs each contour and the next stacks behind it — *opus
+  vermiculatum*, the way a mosaicist works. The first course is held back from
+  its contour so an unbroken interstice runs along every edge. That is what
+  makes the mosaic read as a picture **with the colour taken away**; on a plain
+  grid it never can.
+- **Stones cut to fit.** Courses are laid at full size first, then filling
+  passes cut progressively smaller tesserae into whatever gaps are left, the way
+  a mosaicist shapes an odd stone rather than leaving a hole. Without them any
+  gap narrower than one stone stays bare and reads as a deliberate white shape;
+  with them the mosaic covers the whole picture and the only bare paper is a
+  thin, even grout line.
+- **The mosaic in your paints** — the photo beside the mosaic rendered in the
+  colours your palette can actually reach, with hand-laid tesserae and grout.
+- **A cartoon** — every stone outlined at true size with its colour number
+  inside. A flowing course cannot be addressed by row and column, so you trace
+  the stones, which is how a mosaic is really transferred. (Switch *Layout* to
+  **Square grid** if you would rather rule a lettered lattice onto paper.)
+- **A legend** — per colour: the photo's colour beside what your palette
+  reaches, the mix as a ratio of parts, the wash strength, tile count and
+  coverage, and the honest ΔE. Colours are numbered **lightest first**, so
+  painting them in order is also painting light to dark.
+- **Export Cartoon (to scale)** — prints at your chosen tessera size (12 mm by
+  default), tiled across as many sheets as it needs, with crop marks and
+  "row 1 / col 2" labels so they assemble unambiguously. Tape them together and
+  paint straight from them, or trace them onto your paper.
+
+*Irregularity* is measured against the *grout*, not the stone — two neighbours
+can each shift a corner by at most half the gap, so a tessera can never leave
+its own footprint. A wider grout is therefore what buys a more hand-cut look.
+The grout itself is floored at a visible minimum, because two wet watercolor
+squares that touch bleed into one.
+
 ## Run
 
 ```bash
@@ -77,7 +120,10 @@ python main.py
 4. Read the recipes and ladders; click a target row to anchor the harmony
    wheel on it; click a paint swatch to anchor on that paint instead.
 5. **Export** — SVG (layered, Inkscape-friendly), PNG, or a to-scale PDF
-   (set a Card width first) to print and keep at the easel.
+   (set a Card width first) to print and keep at the easel. PDFs are true
+   vector, so text and edges stay sharp at any size. In mosaic mode,
+   **Export Cartoon** prints the numbered stones at true tessera size across
+   however many sheets that takes.
 
 Sessions auto-restore on launch. Undo/redo covers every edit. Saved presets
 capture the board/solver "look" but never overwrite your palette.
@@ -106,7 +152,15 @@ stage-cache behavior, board layout/hit-testing, SVG/PNG/PDF export, session
 round-trips, and an offscreen run of the full UI. For the painting plan it
 also locks the invariants that make the plan safe to follow — passages cover
 the image exactly, every one is painted once or reserved, washes run strictly
-light to dark, and volumes scale only with paper size.
+light to dark, and volumes scale only with paper size. For the mosaic it locks
+that every tessera stays inside its own footprint at any grout and irregularity
+setting, that colours are numbered lightest first, that the to-scale sheet
+prints one cell per tessera, and that the tile plan pages a wall-sized grid
+correctly. The andamento is tested on a synthetic disc, where a course that
+follows the drawing *must* run tangential to the circle — horizontal bands
+could not tell andamento apart from a lattice. Coverage is measured by
+rasterizing the drawn stones, so a regression that reopens bare patches fails
+rather than merely looking wrong.
 
 ## License note
 

@@ -1,8 +1,14 @@
-"""Raster renderer: draw a ``Scene`` with QPainter.
+"""QPainter renderer for a ``Scene``.
 
-Used both for the live preview and for PNG export, so what you see is exactly
-what gets exported. Kept in the UI package because it depends on Qt; the SVG
-renderer (``studio.svg``) is the Qt-free equivalent.
+:func:`paint_scene` draws onto *any* already-transformed painter in scene
+coordinates; :func:`render_scene` is the raster wrapper that makes a QImage and
+calls it. Splitting the two is what lets the PDF writer paint straight onto a
+``QPdfWriter`` — vector output at any size, no intermediate raster — while the
+live preview and PNG export keep sharing exactly the same drawing code, so what
+you see is what gets exported.
+
+Kept in the UI package because it depends on Qt; the SVG renderer
+(``studio.svg``) is the Qt-free equivalent.
 """
 from __future__ import annotations
 
@@ -61,21 +67,22 @@ def _draw_text(painter: QPainter, t: Text) -> None:
     painter.drawText(QPointF(x, t.y), t.text)
 
 
-def render_scene(scene: Scene, scale: float = 1.0) -> QImage:
+def paint_scene(painter: QPainter, scene: Scene) -> None:
+    """Paint ``scene`` onto an already-transformed painter, in scene coordinates.
+
+    The caller owns the transform (scale, margin offset, page translation for a
+    PDF tile). Content occupies ``[0, w] × [0, h]``; the background fills the
+    margin-padded rect ``[-m, w+m] × [-m, h+m]``, the same rect the raster and
+    SVG exports cover.
+    """
     m = max(0, int(scene.margin))
-    w = max(1, round((scene.width + 2 * m) * scale))
-    h = max(1, round((scene.height + 2 * m) * scale))
-    img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
-    img.fill(QColor(scene.background))
+    painter.fillRect(
+        QRectF(-m, -m, scene.width + 2 * m, scene.height + 2 * m),
+        QColor(scene.background),
+    )
 
-    painter = QPainter(img)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-    painter.scale(scale, scale)
-    if m:
-        painter.translate(m, m)
-
-    # Raster patches (the reference photo) sit beneath the vector layers.
+    # Raster patches (the reference photo, the mosaic maps) sit beneath the
+    # vector layers.
     for patch in scene.patches:
         painter.setOpacity(float(patch.opacity))
         painter.drawImage(
@@ -106,5 +113,21 @@ def render_scene(scene: Scene, scale: float = 1.0) -> QImage:
         for text in layer.texts:
             _draw_text(painter, text)
     painter.setOpacity(1.0)
+
+
+def render_scene(scene: Scene, scale: float = 1.0) -> QImage:
+    m = max(0, int(scene.margin))
+    w = max(1, round((scene.width + 2 * m) * scale))
+    h = max(1, round((scene.height + 2 * m) * scale))
+    img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+    img.fill(QColor(scene.background))
+
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    painter.scale(scale, scale)
+    if m:
+        painter.translate(m, m)
+    paint_scene(painter, scene)
     painter.end()
     return img

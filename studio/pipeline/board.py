@@ -72,6 +72,7 @@ class BoardLayout:
     target_rects: List[Tuple[Rect, int]] = field(default_factory=list)   # (rect, target idx)
     wheel: Optional[Tuple[float, float, float]] = None                   # cx, cy, r
     pass_rects: List[Tuple[Rect, int]] = field(default_factory=list)     # plan: (rect, pass idx)
+    color_rects: List[Tuple[Rect, int]] = field(default_factory=list)    # mosaic: (rect, colour idx)
 
 
 # --- small geometry helpers ---------------------------------------------------

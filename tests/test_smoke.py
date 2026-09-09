@@ -10,6 +10,7 @@ Run:  QT_QPA_PLATFORM=offscreen python tests/test_smoke.py
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -23,12 +24,14 @@ from studio import color  # noqa: E402
 from studio import mixer  # noqa: E402
 from studio.models import Paint, Target  # noqa: E402
 from studio.palettes import ACRYLIC_STARTER, OIL_STARTER, OILPASTEL_STARTER, WATERCOLOR_STARTER  # noqa: E402
-from studio.params import DOC_BOARD, DOC_PLAN, PRESET_FIELDS, PRESETS, Params, apply_preset, apply_preset_values, preset_to_dict  # noqa: E402
+from studio.params import DOC_BOARD, DOC_MOSAIC, DOC_PLAN, PRESET_FIELDS, PRESETS, Params, apply_preset, apply_preset_values, preset_to_dict  # noqa: E402
 from studio.pipeline import Pipeline  # noqa: E402
 from studio.pipeline.loader import LoadedImage, load  # noqa: E402
+from studio.pipeline.mosaic_doc import build_grid_sheet  # noqa: E402
 from studio.pipeline.solver import ACHIEVABLE_DE, solve_targets  # noqa: E402
-from studio.pipeline import plan_regions, plan_schedule  # noqa: E402
-from studio.scene import ALL_LAYERS, LAYER_PLAN_MAP, LAYER_PLAN_PASSES, LAYER_RECIPES, LAYER_WHEEL, PLAN_LAYERS  # noqa: E402
+from studio.pdf_export import PAPER_SIZES_IN, plan_tiles  # noqa: E402
+from studio.pipeline import mosaic_doc, mosaic_flow, mosaic_grid, plan_regions, plan_schedule  # noqa: E402
+from studio.scene import ALL_LAYERS, LAYER_MOSAIC_LEGEND, LAYER_PLAN_MAP, LAYER_PLAN_PASSES, LAYER_RECIPES, LAYER_WHEEL, MOSAIC_LAYERS, PLAN_LAYERS  # noqa: E402
 from studio.svg import scene_to_svg  # noqa: E402
 
 PASS, FAIL = "PASS", "FAIL"
@@ -81,6 +84,61 @@ def run_plan(img=None, **kw):
     pipe.set_source(LoadedImage(rgb=img if img is not None else make_plan_scene(),
                                 source_path="synthetic"))
     p = plan_params(**kw)
+    return pipe, p, pipe.run(p)
+
+
+# A light disc on a dark ground: the one contour is a circle, so a course that
+# follows the drawing must run tangential to it. Horizontal bands could not tell
+# andamento apart from a plain lattice.
+BLOB_R = 90.0
+
+
+def make_blob_scene(h: int = 300, w: int = 300) -> np.ndarray:
+    yy, xx = np.mgrid[0:h, 0:w]
+    inside = ((xx - w / 2.0) ** 2 + (yy - h / 2.0) ** 2) <= BLOB_R ** 2
+    img = np.where(inside[..., None], np.array([226, 220, 208]), np.array([54, 58, 66]))
+    rng = np.random.default_rng(5)
+    return np.clip(img + rng.integers(-3, 4, img.shape), 0, 255).astype(np.uint8)
+
+
+def painted_fraction(tesserae, grout: float, n: int = 320) -> float:
+    """Share of the picture the drawn stones actually cover, by rasterizing them."""
+    acc = np.zeros((n, n), dtype=bool)
+    yy, xx = np.mgrid[0:n, 0:n]
+    for te in tesserae:
+        mx = sum(p[0] for p in te.points) / 4.0
+        my = sum(p[1] for p in te.points) / 4.0
+        px = np.array([(mx + (p[0] - mx) * (1 - grout)) * n for p in te.points])
+        py = np.array([(my + (p[1] - my) * (1 - grout)) * n for p in te.points])
+        x0, x1 = int(max(0, px.min())), int(min(n, px.max() + 1))
+        y0, y1 = int(max(0, py.min())), int(min(n, py.max() + 1))
+        if x0 >= x1 or y0 >= y1:
+            continue
+        sx, sy = xx[y0:y1, x0:x1], yy[y0:y1, x0:x1]
+        inside = np.ones(sx.shape, dtype=bool)
+        for i in range(4):
+            ax, ay = px[i], py[i]
+            bx, by = px[(i + 1) % 4], py[(i + 1) % 4]
+            inside &= ((bx - ax) * (sy - ay) - (by - ay) * (sx - ax)) >= -1e-9
+        acc[y0:y1, x0:x1] |= inside
+    return float(acc.mean())
+
+
+def mosaic_params(**kw) -> Params:
+    base = dict(doc_mode=DOC_MOSAIC, palette=WATERCOLOR_STARTER, tiles_x=16)
+    base.update(kw)
+    return Params(**base)
+
+
+def run_lattice(**kw):
+    return run_mosaic(tessera_layout="grid", **kw)
+
+
+def run_mosaic(img=None, **kw):
+    pipe = Pipeline()
+    pipe.set_source(LoadedImage(rgb=img if img is not None else make_plan_scene(),
+                                source_path="synthetic"))
+    p = mosaic_params(**kw)
     return pipe, p, pipe.run(p)
 
 
@@ -436,8 +494,7 @@ def group13_offscreen_render():
 
 def group14_to_scale_export():
     print("\n[14] To-scale export")
-    from studio.pdf_export import MAX_RASTER_EDGE, raster_scale, write_scale_pdf
-    from studio.ui.render import render_scene
+    from studio.ui.pdf_print import write_scale_pdf
 
     p = Params(manual_targets=(Target(hex="#7a5c3a"),), card_w=11.0)
     res = Pipeline().run(p)
@@ -447,24 +504,28 @@ def group14_to_scale_export():
     p_cm = p.copy(card_w=28.0, canvas_units="cm")
     svg_cm = scene_to_svg(Pipeline().run(p_cm).scene)
     check('width="28cm"' in svg_cm, "cm units label the SVG in centimetres")
-    ipp = res.scene.inches_per_px
-    scale = raster_scale(res.scene.width, res.scene.height, 0, ipp)
-    longest = max(res.scene.width, res.scene.height) * scale
-    check(longest <= MAX_RASTER_EDGE + 1, "raster cap respected")
     with tempfile.TemporaryDirectory() as td:
-        png_path = os.path.join(td, "board.pdf")
-        image = render_scene(res.scene, min(scale, 0.5))
-        from PySide6.QtCore import QBuffer, QByteArray
-
-        ba = QByteArray()
-        buf = QBuffer(ba)
-        buf.open(QBuffer.WriteOnly)
-        image.save(buf, "PNG")
-        buf.close()
-        write_scale_pdf(ba.data(), 11.0, 11.0 * res.scene.height / res.scene.width, png_path)
-        with open(png_path, "rb") as fh:
-            head = fh.read(5)
-        check(head == b"%PDF-", "PDF export starts with %PDF")
+        pdf_path = os.path.join(td, "board.pdf")
+        w_in, h_in = write_scale_pdf(res.scene, pdf_path)
+        check(abs(w_in - 11.0) < 1e-6, f"the page is exactly the card width ({w_in:.3f} in)")
+        with open(pdf_path, "rb") as fh:
+            check(fh.read(5) == b"%PDF-", "PDF export starts with %PDF")
+        import fitz
+        doc = fitz.open(pdf_path)
+        try:
+            check(doc.page_count == 1, "a card-sized board is a single page")
+            check(abs(doc[0].rect.width / 72.0 - 11.0) < 0.02,
+                  "the PDF page really measures 11 in across")
+            # The whole point of the vector path: text survives as text.
+            check(len(doc[0].get_text().strip()) > 40,
+                  "board text is real text in the PDF, not a raster")
+        finally:
+            doc.close()
+    try:
+        write_scale_pdf(Pipeline().run(Params()).scene, os.devnull)
+        check(False, "an unscaled scene is refused a to-scale PDF")
+    except ValueError:
+        check(True, "an unscaled scene is refused a to-scale PDF")
 
 
 def group15_session_roundtrip():
@@ -525,6 +586,7 @@ def group17_ui_smoke():
     QSettings().clear()  # keep this run hermetic
     from studio.ui.controls import ControlsPanel, FloatSlider
     from studio.ui.main_window import MainWindow
+    from studio.ui.pdf_print import write_tiled_pdf
 
     sl = FloatSlider(0.002, 0.06, 0.012, decimals=4, log=True)
     sl.setValue(0.01)
@@ -614,6 +676,56 @@ def group17_ui_smoke():
     win._on_preview_click(prx + prw / 2, pry + prh / 2, 0)
     check(win.params.selected_pass == -1, "clicking the same wash again clears the highlight")
     check(win._doc_stem() == "painting-plan", "exports are named for the plan")
+
+    # --- mosaic guide through the real window ---------------------------------
+    mos_p = Params(doc_mode=DOC_MOSAIC, palette=WATERCOLOR_STARTER, tiles_x=18,
+                   mosaic_colors=9, tessera_mm=15.0, grout_frac=0.2,
+                   tessera_jitter=0.4, show_mosaic_legend=False)
+    mos_panel = ControlsPanel(mos_p)
+    mos_panel.apply(mos_p)
+    check(mos_panel.collect(mos_p) == mos_p, "controls round-trip the mosaic fields")
+    check(not mos_panel._g_mosaic.isHidden(), "mosaic mode shows the mosaic controls")
+    check(mos_panel._g_plan.isHidden() and mos_panel._g_board.isHidden(),
+          "mosaic mode hides the other documents' controls")
+    check(not mos_panel.medium.isEnabled(), "mosaic mode locks the medium to watercolor")
+
+    win.controls.apply(win.params.copy(doc_mode=DOC_MOSAIC, tiles_x=18))
+    win._on_controls_changed()
+    win._render_now()
+    deadline = time.monotonic() + 30.0
+    while (win._busy or win._pending or win._timer.isActive()
+           or win._result is None or win._result.mosaic is None) and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    check(win.params.doc_mode == DOC_MOSAIC, "the window switched to mosaic mode")
+    check(win._result is not None and win._result.mosaic is not None,
+          "the window renders a mosaic guide")
+    check(win.act_grid.isVisible() and win.act_grid.isEnabled(),
+          "the to-scale grid export is offered in mosaic mode")
+    check(win._doc_stem() == "mosaic-guide", "exports are named for the mosaic")
+    # Clicking a legend row highlights that colour, and clicking again clears it.
+    if win._result.layout.color_rects:
+        (crx, cry, crw, crh), cidx = win._result.layout.color_rects[0]
+        win._on_preview_click(crx + crw / 2, cry + crh / 2, 0)
+        check(win.params.selected_color == cidx, "clicking a legend row selects that colour")
+        win._on_preview_click(crx + crw / 2, cry + crh / 2, 0)
+        check(win.params.selected_color == -1, "clicking it again clears the highlight")
+    # The to-scale grid really writes a multi-page vector PDF.
+    sheet = build_grid_sheet(win.params, win._result.mosaic)
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "grid.pdf")
+        pages, prows, pcols = write_tiled_pdf(sheet, out)
+        check(os.path.getsize(out) > 2000, f"the tiled grid PDF is written ({pages} pages)")
+        check(pages == prows * pcols, "the PDF has one page per tile")
+        import fitz
+        doc = fitz.open(out)
+        try:
+            check(doc.page_count == pages, "the PDF really holds that many pages")
+            a4_w = PAPER_SIZES_IN["A4"][0] * 72.0
+            check(abs(doc[0].rect.width - a4_w) < 1.5, "pages come out A4")
+            check(len(doc[0].get_text().strip()) > 0, "cell numbers are real text, not a raster")
+        finally:
+            doc.close()
 
     win._thread.quit()
     win._thread.wait(3000)
@@ -837,6 +949,348 @@ def group21_plan_cache():
           "switching back to the plan restores it unchanged")
 
 
+def group22_mosaic_grid():
+    print("\n[22] Mosaic — tesserae & colour stock")
+    _pipe, p, res = run_lattice()
+    g = res.mosaic
+    check(g is not None, "mosaic mode produces a grid")
+    check(g.layout == "grid", "the lattice layout is honoured")
+    check(g.cols == 16, f"tiles_x sets the column count (got {g.cols})")
+    # 300x400 source -> rows track the aspect.
+    src_h, src_w = make_plan_scene().shape[:2]
+    check(g.rows == round(g.cols * src_h / src_w),
+          f"rows follow the photo's aspect (got {g.rows})")
+    check(g.cells.shape == (g.rows, g.cols), "the cell map is rows x cols")
+    check(g.total == g.rows * g.cols, "the lattice fills every cell")
+    check(sum(g.counts) == g.total, "the per-colour counts cover every tessera")
+    check(len(g.colors) == len(g.counts), "every colour has a count")
+    check(all(c > 0 for c in g.counts), "no colour is left unused")
+    check(int(g.cells.min()) == 0 and int(g.cells.max()) == len(g.colors) - 1,
+          "cell values index exactly the colour list")
+    check(abs(sum(g.fraction(i) for i in range(len(g.colors))) - 1.0) < 1e-9,
+          "colour fractions sum to 1")
+    # Lightest first — which is also the painting order.
+    ls = [color.lstar(color.hex_to_rgb(c)) for c in g.colors]
+    check(all(ls[i] >= ls[i + 1] for i in range(len(ls) - 1)),
+          f"colours are numbered lightest first ({[f'{v:.0f}' for v in ls]})")
+    # Determinism, and the colour count is honoured.
+    _p2, _q2, res2 = run_lattice()
+    check(res2.mosaic.colors == g.colors, "quantization is deterministic")
+    check(np.array_equal(res2.mosaic.cells, g.cells), "the cell map is deterministic")
+    _p3, _q3, res3 = run_lattice(mosaic_colors=5)
+    check(len(res3.mosaic.colors) == 5, "mosaic_colors sets the palette size")
+    # Bounds are clamped rather than trusted.
+    check(mosaic_grid.grid_shape(400, 300, 500)[0] == mosaic_grid.MAX_TILES,
+          "an absurd tiles_x clamps to MAX_TILES")
+    check(mosaic_grid.grid_shape(400, 300, 1)[0] == mosaic_grid.MIN_TILES,
+          "a tiny tiles_x clamps to MIN_TILES")
+    # Recipes are index-aligned with the colours.
+    check(len(res.recipes) >= len(g.colors), "every mosaic colour got a recipe")
+    check(all(res.recipes[i].target_hex == c for i, c in enumerate(g.colors)),
+          "recipes stay index-aligned with the colour stock")
+
+
+def group23_mosaic_tesserae():
+    print("\n[23] Mosaic — tesserae geometry")
+    _pipe, p, res = run_lattice()
+    g = res.mosaic
+    colors = mosaic_doc.cell_colors(g, res.recipes)
+    check(len(colors) == len(g.colors), "every colour maps to a painted colour")
+    check(colors[0] == res.recipes[0].mixed_hex,
+          "tesserae are drawn in the colour the palette actually reaches")
+    W, H = 640.0, 640.0 * g.rows / g.cols
+    strokes = mosaic_doc.tesserae_strokes(g, colors, 0.0, 0.0, W, H,
+                                          p.grout_frac, p.tessera_jitter, p.background)
+    check(len(strokes) == g.total, "one quad per tessera")
+    check(all(len(s.points) == 4 and s.closed for s in strokes), "each tessera is a closed quad")
+    # The invariant the whole jitter model rests on: a corner can never leave
+    # its own footprint, so two tesserae can never touch or overlap.
+    cw, ch = W / g.cols, H / g.rows
+    escaped = 0
+    for gf in (0.0, 0.05, 0.18, 0.30):
+        for jt in (0.0, 0.5, 1.0, 2.0):   # 2.0 is out of range and must clamp
+            st = mosaic_doc.tesserae_strokes(g, colors, 0.0, 0.0, W, H, gf, jt, p.background)
+            for i, s in enumerate(st):
+                r, c = divmod(i, g.cols)
+                for px, py in s.points:
+                    if not (c * cw - 1e-9 <= px <= (c + 1) * cw + 1e-9
+                            and r * ch - 1e-9 <= py <= (r + 1) * ch + 1e-9):
+                        escaped += 1
+    check(escaped == 0, f"no tessera corner ever leaves its cell ({escaped} escapes)")
+    # Zero jitter is a perfect grid; more jitter genuinely moves things.
+    flat = mosaic_doc.tesserae_strokes(g, colors, 0.0, 0.0, W, H, 0.18, 0.0, p.background)
+    rough = mosaic_doc.tesserae_strokes(g, colors, 0.0, 0.0, W, H, 0.18, 1.0, p.background)
+    check(all(len({round(x, 6) for x, _y in s.points}) == 2 for s in flat[:20]),
+          "zero jitter gives axis-aligned squares")
+    moved = sum(1 for a, b in zip(flat, rough) if a.points != b.points)
+    check(moved == len(flat), "full jitter displaces every tessera")
+    same = mosaic_doc.tesserae_strokes(g, colors, 0.0, 0.0, W, H, 0.18, 1.0, p.background)
+    check([s.points for s in same] == [s.points for s in rough],
+          "the jitter pattern is stable across renders")
+    # The grout floor is a watercolor requirement, not a style choice.
+    check(mosaic_doc.draw_grout(0.0) == mosaic_flow.MIN_GROUT,
+          "grout is floored so two wet squares can never touch")
+    check(mosaic_doc.draw_grout(0.25) == 0.25, "a generous grout is used as given")
+    # Row labels run past Z without repeating.
+    labels = [mosaic_doc.row_label(i) for i in range(60)]
+    check(labels[0] == "A" and labels[25] == "Z" and labels[26] == "AA",
+          f"row labels go A..Z then AA (got {labels[25]}, {labels[26]})")
+    check(len(set(labels)) == len(labels), "row labels never repeat")
+
+
+def group24_mosaic_document():
+    print("\n[24] Mosaic — document & to-scale sheet")
+    _pipe, p, res = run_mosaic()
+    scene = res.scene
+    names = [ly.name for ly in scene.layers]
+    check(names == list(MOSAIC_LAYERS), f"mosaic layers present in order (got {names})")
+    check(len(res.layout.color_rects) == len(res.mosaic.colors), "every colour row is clickable")
+    check(res.layout.photo_rect is not None, "the mosaic exposes a photo rect")
+    # Section toggles are compose-only.
+    _p2, _q2, off = run_mosaic(show_mosaic_grid=False)
+    check(off.scene.height < scene.height, "turning off the grid shortens the document")
+    check(off.mosaic.colors == res.mosaic.colors, "a section toggle leaves the grid alone")
+    # Selecting a colour highlights without changing anything.
+    _p3, _q3, sel = run_mosaic(selected_color=0)
+    check(sel.mosaic.colors == res.mosaic.colors, "selection never changes the colours")
+    check(len(sel.scene.layer(LAYER_MOSAIC_LEGEND).strokes)
+          == len(scene.layer(LAYER_MOSAIC_LEGEND).strokes) + 1,
+          "selecting a colour draws exactly one highlight")
+    # Text stays on the page.
+    longest = max((t for ly in scene.layers for t in ly.texts),
+                  key=lambda t: len(t.text) * t.size)
+    check(longest.x + len(longest.text) * longest.size * 0.62 <= scene.width + 1,
+          f"the longest generated line fits the page ({len(longest.text)} chars)")
+    # SVG export.
+    svg = scene_to_svg(scene)
+    check("CC BY-NC" in svg, "the mosaic guide carries the Mixbox attribution")
+    for name in MOSAIC_LAYERS:
+        check(f'inkscape:label="{name}"' in svg, f"SVG has the {name} layer")
+    # No photo -> a message, not a crash.
+    empty = Pipeline().run(mosaic_params())
+    check(empty.mosaic is None, "no photo means no grid")
+    head = " ".join(t.text for t in empty.scene.layer("header").texts)
+    check("reference photo" in head, "the empty mosaic asks for a photo")
+
+    # The to-scale sheet carries a real physical scale.
+    sheet = mosaic_doc.build_grid_sheet(p, res.mosaic)
+    ipp = sheet.inches_per_px
+    check(ipp > 0, "the grid sheet carries a physical scale")
+    cell_in = mosaic_doc.SHEET_CELL * ipp
+    check(abs(cell_in - p.tessera_mm / 25.4) < 1e-9,
+          f"one sheet cell prints as one tessera ({cell_in * 25.4:.2f} mm)")
+    grid_in = res.mosaic.cols * cell_in
+    check(sheet.width * ipp > grid_in, "the sheet is at least as wide as the grid")
+    sheet2 = mosaic_doc.build_grid_sheet(p.copy(tessera_mm=p.tessera_mm * 2), res.mosaic)
+    check(abs(sheet2.inches_per_px - 2 * ipp) < 1e-12,
+          "doubling the tessera size doubles the printed scale")
+
+
+def group25_mosaic_tiling():
+    print("\n[25] Mosaic — multi-page tile plan")
+    a4_w, a4_h = PAPER_SIZES_IN["A4"]
+    margin, overlap = 10.0 / 25.4, 10.0 / 25.4
+    pw, ph = a4_w - 2 * margin, a4_h - 2 * margin
+    # A sheet that fits is one clean page.
+    tiles, rows, cols = plan_tiles(100, 100, 0, 0.05, pw, ph, overlap)
+    check((rows, cols) == (1, 1) and len(tiles) == 1, "a sheet that fits gives one page")
+    check(tiles[0] == (0, 0, 0.0, 0.0), "the single tile starts at the origin")
+    # A 60 cm grid needs several sheets, and the stride respects the overlap.
+    ipp = 0.05
+    wide = int(round((60.0 / 2.54) / ipp))
+    tiles, rows, cols = plan_tiles(wide, wide, 0, ipp, pw, ph, overlap)
+    check(cols == math.ceil((60.0 / 2.54 - overlap) / (pw - overlap)),
+          f"a 60 cm grid tiles across the expected column count (got {cols})")
+    check(len(tiles) == rows * cols, "the plan emits one tile per page")
+    check(all(t[0] < rows and t[1] < cols for t in tiles), "tile indices stay in range")
+    stride = (tiles[1][2] - tiles[0][2]) * ipp
+    check(abs(stride - (pw - overlap)) < 1e-9,
+          f"adjacent tiles overlap by exactly the tape band ({stride:.3f} in)")
+    check(plan_tiles(wide, wide, 0, ipp, pw, ph, 0.0)[2] <= cols,
+          "no overlap needs no more pages than overlapping does")
+    # Bad inputs are refused rather than producing a silent mess.
+    for bad, why in (
+        (lambda: plan_tiles(100, 100, 0, 0.0, pw, ph, overlap), "no physical scale"),
+        (lambda: plan_tiles(100, 100, 0, 0.05, overlap, ph, overlap), "overlap >= paper"),
+    ):
+        try:
+            bad()
+            check(False, f"plan_tiles rejects {why}")
+        except ValueError:
+            check(True, f"plan_tiles rejects {why}")
+
+
+def group26_mosaic_cache():
+    print("\n[26] Mosaic — caching & mode switching")
+    pipe, p, res = run_mosaic()
+    check(pipe.run(p).recomputed == [], "a repeat mosaic run recomputes nothing")
+    # Drawing decisions must never reach the cache.
+    for field, value in (("grout_frac", 0.05), ("tessera_jitter", 0.2),
+                         ("tessera_mm", 25.0), ("show_mosaic_legend", False),
+                         ("selected_color", 1)):
+        check(pipe.run(p.copy(**{field: value})).recomputed == [],
+              f"{field} is compose-only")
+    # Grid settings re-quantize and re-solve.
+    check(pipe.run(p.copy(tiles_x=20)).recomputed == ["mosaic", "solve"],
+          "tiles_x re-lays the tesserae")
+    check(pipe.run(p.copy(mosaic_colors=6)).recomputed == ["mosaic", "solve"],
+          "mosaic_colors re-quantizes")
+    pipe.run(p)
+    # Renaming a paint is free, and still reaches the printed legend.
+    first = res.recipes[0].steps[0]
+    renamed = tuple(
+        Paint(name="Renamed Sienna", hex=q.hex, is_white=q.is_white, opacity=q.opacity,
+              staining=q.staining, granulating=q.granulating)
+        if q.hex == first.paint_hex else q
+        for q in p.palette
+    )
+    res_r = pipe.run(p.copy(palette=renamed))
+    check(res_r.recomputed == [], "renaming a paint recomputes nothing in mosaic mode")
+    printed = " ".join(t.text for t in res_r.scene.layer(LAYER_MOSAIC_LEGEND).texts)
+    check("Renamed Sienna" in printed, "a renamed paint still reaches the printed legend")
+    # Documents stay out of each other's stages.
+    board = pipe.run(p.copy(doc_mode=DOC_BOARD))
+    check("mosaic" not in board.recomputed,
+          f"board mode never mentions the mosaic stage (got {board.recomputed})")
+    check(len(board.recipes) > 0 and len(board.auto_targets) > 0,
+          "board mode still extracts photo targets after a mosaic run")
+    mos = pipe.run(p)
+    check("ladders" not in mos.recomputed and "passages" not in mos.recomputed,
+          f"mosaic mode never mentions plan stages (got {mos.recomputed})")
+    check(mos.mosaic is not None and mos.mosaic.colors == res.mosaic.colors,
+          "switching back to the mosaic restores it unchanged")
+    plan = pipe.run(p.copy(doc_mode=DOC_PLAN))
+    check(plan.passage_map is not None and plan.mosaic is None,
+          "plan mode after a mosaic run builds passages, not tesserae")
+
+
+def group27_mosaic_andamento():
+    print("\n[27] Mosaic — andamento (courses that follow the drawing)")
+    _pipe, p, res = run_mosaic()          # default layout is "flow"
+    g = res.mosaic
+    check(g.layout == "flow", "flow is the default layout")
+    check(g.cells is None, "the flow layout has no lattice to address")
+    check(g.total > 0, f"the flow layout lays stones ({g.total})")
+    check(sum(g.counts) == g.total, "counts cover every stone laid")
+    check(all(0 <= t.color < len(g.colors) for t in g.tesserae),
+          "every stone takes a colour from the stock")
+    check(all(len(t.points) == 4 for t in g.tesserae), "every stone is a quad")
+    check(all(0.0 <= v <= 1.0 for t in g.tesserae for pt in t.points for v in pt),
+          "stones stay inside the picture")
+    # The mosaic must cover the whole picture. Bare patches larger than the
+    # grout read as deliberate white shapes, not as a mosaic, so the filling
+    # passes cut smaller stones until the gaps close.
+    covered = painted_fraction(g.tesserae, mosaic_doc.draw_grout(p.grout_frac))
+    check(covered > 0.60, f"the stones cover the picture ({covered * 100:.0f}% painted)")
+    check(g.total > g.cols * g.rows * 0.85,
+          f"filling passes lay more stones than a plain lattice would ({g.total})")
+    edges = sorted({round(math.dist(t.points[0], t.points[1]), 4) for t in g.tesserae})
+    check(len(edges) > 1, f"stones come in several sizes ({len(edges)} distinct)")
+    check(edges[0] < edges[-1] * 0.6, "the smallest fillers are genuinely cut down")
+    # Without the small fillers the same picture is left with holes.
+    _pn, _qn, none_res = run_mosaic(tiles_x=16)
+    check(painted_fraction(none_res.mosaic.tesserae, 0.10) > 0.55,
+          "coverage holds at other stone sizes too")
+    # Determinism.
+    _p2, _q2, res2 = run_mosaic()
+    check([t.points for t in res2.mosaic.tesserae] == [t.points for t in g.tesserae],
+          "the flow layout is deterministic")
+
+    # --- what makes it a mosaic rather than a grid --------------------------
+    def angle_of(t):
+        (x0, y0), (x1, y1) = t.points[0], t.points[1]
+        return math.atan2(y1 - y0, x1 - x0) % (math.pi / 2.0)
+
+    # The real test: on a disc, a course that follows the drawing must run
+    # tangential to the circle. Bands of colour could not distinguish andamento
+    # from a lattice, so this uses a curved contour on purpose.
+    _pb, _qb, blob = run_mosaic(img=make_blob_scene(), tiles_x=24)
+    bg = blob.mosaic
+    ring = []
+    for t in bg.tesserae:
+        dx, dy = t.cx - 0.5, t.cy - 0.5
+        r = math.hypot(dx, dy)
+        if 0.20 < r < 0.34:                      # the courses hugging the rim
+            radial = math.atan2(dy, dx)
+            tangent = (radial + math.pi / 2.0) % (math.pi / 2.0)
+            err = abs(angle_of(t) - tangent) % (math.pi / 2.0)
+            ring.append(min(err, math.pi / 2.0 - err))
+    check(len(ring) > 20, f"the disc has a rim course to measure ({len(ring)} stones)")
+    aligned = sum(1 for e in ring if e < 0.35)   # within ~20 degrees of tangent
+    check(aligned > 0.7 * len(ring),
+          f"rim stones run tangential to the contour ({aligned}/{len(ring)})")
+    spread = float(np.std([angle_of(t) for t in bg.tesserae]))
+    check(spread > 0.2, f"stone angles genuinely vary around the disc ({spread:.2f} rad)")
+    # The lattice, by contrast, is axis-aligned everywhere.
+    _pl, _ql, lat = run_lattice()
+    check(all(angle_of(t) < 1e-9 for t in lat.mosaic.tesserae),
+          "the lattice layout stays square to the page")
+
+    # Neighbouring stones agree in direction — that is a *course*, not noise.
+    angles = [angle_of(t) for t in bg.tesserae]
+    pts = np.array([[t.cx, t.cy] for t in bg.tesserae])
+    agree = 0
+    pairs = 0
+    for i in range(0, len(bg.tesserae), 3):       # sample, for speed
+        d2 = np.sum((pts - pts[i]) ** 2, axis=1)
+        d2[i] = np.inf
+        j = int(np.argmin(d2))
+        diff = abs(angles[i] - angles[j]) % (math.pi / 2.0)
+        diff = min(diff, math.pi / 2.0 - diff)
+        pairs += 1
+        agree += diff < 0.35
+    check(agree > 0.7 * pairs,
+          f"neighbouring stones line up into courses ({agree}/{pairs})")
+
+    # The distance field is the thing that curves, so check it directly: it is
+    # zero on the drawing and rises away from it, never crossing a contour.
+    tier = mosaic_flow.contour_tiers(np.asarray(make_plan_scene(), dtype=np.float64), 3)
+    dist = mosaic_flow.distance_field(tier)
+    check(dist.min() == 0.0, "the field is zero on the drawing")
+    check(dist.max() > 1.0, "the field rises away from the drawing")
+    edge = np.zeros(tier.shape, dtype=bool)
+    edge[:-1, :] |= tier[:-1, :] != tier[1:, :]
+    check(float(dist[edge].max()) == 0.0, "every contour pixel sits at distance zero")
+    ang = mosaic_flow.course_angles(dist, 3)
+    check(ang.shape == dist.shape and np.isfinite(ang).all(), "the angle field is finite")
+
+
+def group28_mosaic_cartoon():
+    print("\n[28] Mosaic — the cartoon")
+    _pipe, p, res = run_mosaic()
+    g = res.mosaic
+    texts = []
+    strokes = mosaic_doc.cartoon_strokes(
+        g, 0.0, 0.0, 600.0, 900.0, p.grout_frac, "#1b1b1b",
+        lambda x, y, s, **kw: texts.append((x, y, s)),
+    )
+    check(len(strokes) == g.total, "the cartoon outlines every stone")
+    check(len(texts) == g.total, "every stone carries its colour number")
+    numbers = {int(t[2]) for t in texts}
+    check(numbers <= set(range(1, len(g.colors) + 1)),
+          "cartoon numbers are all real colour numbers")
+    check(all(s.fill is None for s in strokes), "an unhighlighted cartoon is outlines only")
+    check(all(s.width > 0 for s in strokes), "cartoon stones are drawn as outlines")
+    # Highlighting one colour fills just those stones.
+    hi = mosaic_doc.cartoon_strokes(
+        g, 0.0, 0.0, 600.0, 900.0, p.grout_frac, "#1b1b1b", lambda *a, **k: None, highlight=0)
+    filled = sum(1 for s in hi if s.fill is not None)
+    check(filled == g.counts[0], f"highlighting fills exactly colour 1's stones ({filled})")
+    # The flow document uses the cartoon; the lattice one uses the lettered grid.
+    doc_txt = " ".join(t.text for t in res.scene.layer("mosaic-grid").texts)
+    check("A" not in doc_txt.split(), "the flow document has no row letters to count")
+    _pl, _ql, lat = run_lattice()
+    lat_txt = [t.text for t in lat.scene.layer("mosaic-grid").texts]
+    check("A" in lat_txt, "the lattice document still labels its rows")
+    # The to-scale sheet keeps one stone == one tessera in both layouts.
+    for grid_res, name in ((res, "flow"), (lat, "lattice")):
+        sheet = mosaic_doc.build_grid_sheet(p, grid_res.mosaic)
+        cell_in = mosaic_doc.SHEET_CELL * sheet.inches_per_px
+        check(abs(cell_in - p.tessera_mm / 25.4) < 1e-9,
+              f"the {name} sheet prints one cell per tessera")
+        check(sheet.width > 0 and sheet.height > 0, f"the {name} sheet has a size")
+
+
 def main() -> int:
     group1_color_math()
     group2_mixer()
@@ -859,6 +1313,13 @@ def main() -> int:
     group19_plan_schedule()
     group20_plan_document()
     group21_plan_cache()
+    group22_mosaic_grid()
+    group23_mosaic_tesserae()
+    group24_mosaic_document()
+    group25_mosaic_tiling()
+    group26_mosaic_cache()
+    group27_mosaic_andamento()
+    group28_mosaic_cartoon()
 
     print(f"\n{'=' * 60}")
     if _failures:

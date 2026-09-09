@@ -98,6 +98,25 @@ TIPS: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+# Printed on the mosaic guide. A mosaic is an unusually forgiving first
+# watercolor — no edges to control, no wet-in-wet timing — so the advice is
+# about order and patience rather than brush handling.
+MOSAIC_NOTES: Tuple[str, ...] = (
+    "Rule the grid onto your paper first, lightly, in pencil — or print the "
+    "to-scale sheet and trace it on a window.",
+    "The gaps between squares are the grout: leave them as bare paper. Never "
+    "let two wet squares touch, or they will bleed into one.",
+    "Work one colour at a time, in number order. Number 1 is the palest, so "
+    "you are always painting light before dark.",
+    "Paint every square of a colour before you rinse the well — remixing a "
+    "colour halfway through will not match, and here the mismatch is visible.",
+    "Skip a square if its neighbour is still wet and come back to it. Working "
+    "in a checkerboard is faster than waiting.",
+    "Each square is one loaded brushstroke. Let it dry flat rather than "
+    "brushing it out — the small pooling at the edges is what makes it look "
+    "like stone.",
+)
+
 # Printed at the foot of the plan so the vocabulary above is never a mystery.
 GLOSSARY: Tuple[Tuple[str, str], ...] = (
     ("Wash", "A layer of diluted paint laid over an area, flat or graded."),

@@ -6,7 +6,7 @@ import os
 import time
 from typing import Optional
 
-from PySide6.QtCore import QBuffer, QByteArray, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QColorDialog,
@@ -27,6 +27,7 @@ from ..models import Target
 from ..palettes import STARTERS
 from ..params import (
     CM_PER_INCH,
+    DOC_MOSAIC,
     DOC_PLAN,
     PRESETS,
     UNIT_CM,
@@ -35,13 +36,14 @@ from ..params import (
     apply_preset_values,
     preset_to_dict,
 )
-from ..pdf_export import raster_scale, write_scale_pdf
 from ..pipeline.core import Result
 from ..pipeline.loader import count_pdf_pages, is_pdf
+from ..pipeline.mosaic_doc import build_grid_sheet
 from ..session import decode_session, encode_session
 from ..svg import scene_to_svg
 from .controls import ControlsPanel
 from .palette_panel import PalettePanel
+from .pdf_print import write_scale_pdf as write_scale_pdf_vector, write_tiled_pdf
 from .preview import PreviewWidget
 from .render import ndarray_to_qimage, render_scene
 from .upload import UploadPanel
@@ -122,9 +124,16 @@ class MainWindow(QMainWindow):
         self.act_png = QAction("Export PNG", self)
         self.act_pdf = QAction("Export PDF", self)
         self.act_pdf.setToolTip("To-scale PDF at the Card size — print and keep at the easel.")
+        self.act_grid = QAction("Export Cartoon (to scale)", self)
+        self.act_grid.setToolTip(
+            "Print the numbered mosaic at its true tessera size, tiled across sheets "
+            "you tape together, then trace or paint straight from it."
+        )
         self.act_reset = QAction("Reset", self)
-        for a in (self.act_open, self.act_svg, self.act_png, self.act_pdf, self.act_reset):
+        for a in (self.act_open, self.act_svg, self.act_png, self.act_pdf,
+                  self.act_grid, self.act_reset):
             tb.addAction(a)
+        self.act_grid.setVisible(False)   # mosaic-only
         self.act_svg.setEnabled(False)
         self.act_png.setEnabled(False)
         self.act_pdf.setEnabled(False)
@@ -166,7 +175,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().showMessage(
             "Edit your palette on the left, then pick a document: a palette board, "
-            "or a watercolor painting plan for a photo."
+            "a watercolor painting plan, or a mosaic guide."
         )
 
         # Debounce timer
@@ -180,6 +189,7 @@ class MainWindow(QMainWindow):
         self.act_svg.triggered.connect(self._export_svg)
         self.act_png.triggered.connect(self._export_png)
         self.act_pdf.triggered.connect(self._export_pdf)
+        self.act_grid.triggered.connect(self._export_grid)
         self.act_reset.triggered.connect(self._reset)
         self.act_undo.triggered.connect(self._do_undo)
         self.act_redo.triggered.connect(self._do_redo)
@@ -450,6 +460,17 @@ class MainWindow(QMainWindow):
                 )
                 self._render_now()
                 return
+        # Mosaic mode: clicking a legend row highlights that colour's tesserae.
+        for rect, idx in layout.color_rects:
+            if _in_rect(x, y, rect):
+                sel = -1 if idx == self.params.selected_color else idx
+                self.params = self.params.copy(selected_color=sel)
+                self.statusBar().showMessage(
+                    f"Colour {idx + 1} highlighted — click again to clear."
+                    if sel >= 0 else "Highlight cleared."
+                )
+                self._render_now()
+                return
         # Eyedropper: sample the photo region.
         if (
             self.params.eyedropper_mode
@@ -538,6 +559,9 @@ class MainWindow(QMainWindow):
         self.act_svg.setEnabled(True)
         self.act_png.setEnabled(True)
         self.act_pdf.setEnabled(True)
+        is_mosaic = self.params.doc_mode == DOC_MOSAIC
+        self.act_grid.setVisible(is_mosaic)
+        self.act_grid.setEnabled(is_mosaic and result.mosaic is not None)
         self.progress.setVisible(False)
         note = ", ".join(result.recomputed) if result.recomputed else "style only"
         if self.params.doc_mode == DOC_PLAN and not result.passes and not self._path:
@@ -549,7 +573,10 @@ class MainWindow(QMainWindow):
 
     # -- naming -------------------------------------------------------------
     def _doc_stem(self) -> str:
-        return "painting-plan" if self.params.doc_mode == DOC_PLAN else "palette-board"
+        return {
+            DOC_PLAN: "painting-plan",
+            DOC_MOSAIC: "mosaic-guide",
+        }.get(self.params.doc_mode, "palette-board")
 
     def _on_failed(self, message: str):
         self._busy = False
@@ -616,17 +643,33 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            image = render_scene(scene, raster_scale(scene.width, scene.height, 0, ipp))
-            ba = QByteArray()
-            buf = QBuffer(ba)
-            buf.open(QBuffer.WriteOnly)
-            image.save(buf, "PNG")
-            buf.close()
-            write_scale_pdf(ba.data(), w_in, h_in, path)
+            write_scale_pdf_vector(scene, path)
             unit = scene.canvas_units
             wd, hd = (w_in, h_in) if unit != UNIT_CM else (w_in * CM_PER_INCH, h_in * CM_PER_INCH)
             self.statusBar().showMessage(
                 f"Saved {os.path.basename(path)} ({wd:.1f}×{hd:.1f} {unit} to scale)")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Export failed", str(exc))
+
+    def _export_grid(self):
+        """Write the numbered mosaic grid at true tessera size, tiled across pages."""
+        if not self._result or self._result.mosaic is None:
+            return
+        grid = self._result.mosaic
+        sheet = build_grid_sheet(self.params, grid)
+        w_in = sheet.width * sheet.inches_per_px
+        h_in = sheet.height * sheet.inches_per_px
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export cartoon to scale", "mosaic-cartoon.pdf", "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            pages, rows, cols = write_tiled_pdf(sheet, path)
+            self.statusBar().showMessage(
+                f"Saved {os.path.basename(path)} — {grid.total} tesserae at "
+                f"{self.params.tessera_mm:g} mm ({w_in:.1f}×{h_in:.1f} in) "
+                f"across {pages} page{'s' if pages != 1 else ''} ({rows}×{cols})."
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Export failed", str(exc))
 

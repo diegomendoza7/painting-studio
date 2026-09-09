@@ -27,10 +27,20 @@ from PySide6.QtWidgets import (
 )
 
 from ..media import SPECS
+from ..pipeline.mosaic_grid import (
+    LAYOUT_FLOW,
+    LAYOUT_GRID,
+    MAX_COLORS,
+    MAX_TILES,
+    MIN_COLORS,
+    MIN_TILES,
+)
 from ..params import (
     CM_PER_INCH,
     DOC_BOARD,
+    DOC_MOSAIC,
     DOC_PLAN,
+    WATERCOLOR_DOCS,
     HARMONY_SCHEMES,
     PRESETS,
     SHADE_MODES,
@@ -81,7 +91,11 @@ class FloatSlider(QWidget):
         return 0.0 if span == 0 else (v - self._lo) / span
 
     def value(self) -> float:
-        return self._to_value(self.slider.value() / 1000.0)
+        # Rounded to the decimals actually displayed, so the value read back is
+        # the value shown — and so collect(apply(p)) == p exactly. Without this
+        # the raw float drifts (0.2 -> 0.2001) and every session restore or undo
+        # would report a spurious change.
+        return round(self._to_value(self.slider.value() / 1000.0), self._dec)
 
     def setValue(self, v: float):
         t = self._to_t(v)
@@ -133,10 +147,12 @@ class ControlsPanel(QWidget):
         self.doc_mode = QComboBox()
         self.doc_mode.addItem("Palette board", DOC_BOARD)
         self.doc_mode.addItem("Watercolor painting plan", DOC_PLAN)
+        self.doc_mode.addItem("Mosaic guide", DOC_MOSAIC)
         self._set_combo_data(self.doc_mode, params.doc_mode)
         self.doc_mode.setToolTip(
             "Palette board: a reference sheet of your colours.\n"
-            "Painting plan: numbered washes for the photo you loaded."
+            "Painting plan: numbered washes for the photo you loaded.\n"
+            "Mosaic guide: the photo as tesserae, painted square by square."
         )
         f.addRow("Type", self.doc_mode)
         root.addWidget(g_doc)
@@ -204,6 +220,61 @@ class ControlsPanel(QWidget):
         for cb in (self.show_plan_map, self.show_plan_passes, self.show_plan_tips):
             f.addRow(cb)
         root.addWidget(g_plan)
+
+        # --- Mosaic guide (mosaic mode only) ----------------------------------------
+        g_mosaic = QGroupBox("Mosaic")
+        f = self._form(g_mosaic)
+        self.tessera_layout = QComboBox()
+        self.tessera_layout.addItem("Courses follow the drawing", LAYOUT_FLOW)
+        self.tessera_layout.addItem("Square grid", LAYOUT_GRID)
+        self._set_combo_data(self.tessera_layout, params.tessera_layout)
+        self.tessera_layout.setToolTip(
+            "Courses: tesserae are laid along the picture's contours, the way a "
+            "mosaicist works — the shapes read even with the colour taken away.\n"
+            "Square grid: a plain lattice you can rule onto paper by row and column."
+        )
+        self.tiles_x = QSpinBox()
+        self.tiles_x.setRange(MIN_TILES, MAX_TILES)
+        self.tiles_x.setValue(params.tiles_x)
+        self.tiles_x.setToolTip("Tesserae across. Rows follow the photo's shape.")
+        self.mosaic_colors = QSpinBox()
+        self.mosaic_colors.setRange(MIN_COLORS, MAX_COLORS)
+        self.mosaic_colors.setValue(params.mosaic_colors)
+        self.mosaic_colors.setToolTip("How many colours the whole mosaic is reduced to.")
+        self.tessera_mm = QDoubleSpinBox()
+        self.tessera_mm.setRange(3.0, 60.0)
+        self.tessera_mm.setDecimals(1)
+        self.tessera_mm.setSingleStep(1.0)
+        self.tessera_mm.setSuffix(" mm")
+        self.tessera_mm.setValue(params.tessera_mm)
+        self.tessera_mm.setToolTip(
+            "Painted size of one square. This is what the to-scale grid prints at."
+        )
+        self.grout_frac = FloatSlider(0.0, 0.30, params.grout_frac, decimals=2)
+        self.grout_frac.setToolTip("Gap of bare paper left between squares.")
+        self.tessera_jitter = FloatSlider(0.0, 1.0, params.tessera_jitter, decimals=2)
+        self.tessera_jitter.setToolTip(
+            "How hand-cut the tesserae look. Measured against the grout, so a wider "
+            "grout allows more irregularity — squares can never overlap."
+        )
+        self.show_mosaic_preview = QCheckBox("Photo & mosaic")
+        self.show_mosaic_grid = QCheckBox("Numbered grid")
+        self.show_mosaic_legend = QCheckBox("Colour legend")
+        for cb, v in (
+            (self.show_mosaic_preview, params.show_mosaic_preview),
+            (self.show_mosaic_grid, params.show_mosaic_grid),
+            (self.show_mosaic_legend, params.show_mosaic_legend),
+        ):
+            cb.setChecked(v)
+        f.addRow("Layout", self.tessera_layout)
+        f.addRow("Tesserae across", self.tiles_x)
+        f.addRow("Colours", self.mosaic_colors)
+        f.addRow("Tessera size", self.tessera_mm)
+        f.addRow("Grout", self.grout_frac)
+        f.addRow("Irregularity", self.tessera_jitter)
+        for cb in (self.show_mosaic_preview, self.show_mosaic_grid, self.show_mosaic_legend):
+            f.addRow(cb)
+        root.addWidget(g_mosaic)
 
         # --- Targets --------------------------------------------------------------
         g_targets = QGroupBox("Target colors")
@@ -328,6 +399,7 @@ class ControlsPanel(QWidget):
         # The two documents want different controls; keep both built and just
         # show the relevant set, so collect()/apply() stay mode-agnostic.
         self._g_plan = g_plan
+        self._g_mosaic = g_mosaic
         self._g_medium = g_medium
         self._g_targets = g_targets
         self._g_ladder = g_ladder
@@ -361,11 +433,12 @@ class ControlsPanel(QWidget):
             self.anchor_btn.setText("auto")
 
     def _update_medium_rule(self):
-        if self.doc_mode.currentData() == DOC_PLAN:
-            sp = SPECS["watercolor"]
+        mode = self.doc_mode.currentData()
+        if mode in WATERCOLOR_DOCS:
+            what = "painting plan" if mode == DOC_PLAN else "mosaic guide"
             self.medium_rule.setText(
-                "The painting plan is watercolor — the paper is your white, and "
-                "everything lightens by dilution."
+                f"The {what} is watercolor — the paper is your white, and everything "
+                "lightens by dilution."
             )
         else:
             sp = SPECS[self.medium.currentData()]
@@ -373,29 +446,36 @@ class ControlsPanel(QWidget):
 
     def _sync_mode(self):
         """Show only the controls the current document actually uses."""
-        plan = self.doc_mode.currentData() == DOC_PLAN
-        self._g_plan.setVisible(plan)
-        self.medium.setEnabled(not plan)      # plan mode is always watercolor
+        mode = self.doc_mode.currentData()
+        self._g_plan.setVisible(mode == DOC_PLAN)
+        self._g_mosaic.setVisible(mode == DOC_MOSAIC)
+        # The two watercolor documents pick the medium for you.
+        self.medium.setEnabled(mode not in WATERCOLOR_DOCS)
         for box in (self._g_targets, self._g_ladder, self._g_wheel, self._g_board):
-            box.setVisible(not plan)
+            box.setVisible(mode == DOC_BOARD)
         self._update_medium_rule()
 
     # -- signal wiring ------------------------------------------------------------
     def _wire(self):
         for combo in (self.doc_mode, self.medium, self.max_paints, self.shade_mode,
-                      self.harmony, self.card_units):
+                      self.harmony, self.card_units, self.tessera_layout):
             combo.currentIndexChanged.connect(self._emit)
         self.medium.currentIndexChanged.connect(self._update_medium_rule)
         self.doc_mode.currentIndexChanged.connect(self._sync_mode)
         self.card_units.currentIndexChanged.connect(self._on_units_changed)
-        for sb in (self.extract_n, self.ladder_steps, self.wash_tiers, self.plan_colors):
+        for sb in (self.extract_n, self.ladder_steps, self.wash_tiers, self.plan_colors,
+                   self.tiles_x, self.mosaic_colors):
             sb.valueChanged.connect(self._emit)
-        for sb in (self.card_w, self.min_passage, self.paper_w, self.paper_h):
+        for sb in (self.card_w, self.min_passage, self.paper_w, self.paper_h,
+                   self.tessera_mm):
             sb.valueChanged.connect(self._emit)
+        for sl in (self.grout_frac, self.tessera_jitter):
+            sl.changed.connect(self._emit)
         for cb in (
             self.extract_enabled, self.show_gamut, self.show_photo, self.show_palette,
             self.show_wheel, self.show_value_strip, self.show_recipes, self.show_ladders,
             self.show_notes, self.show_plan_map, self.show_plan_passes, self.show_plan_tips,
+            self.show_mosaic_preview, self.show_mosaic_grid, self.show_mosaic_legend,
         ):
             cb.toggled.connect(self._emit)
         self.board_title.textEdited.connect(self._emit)
@@ -478,6 +558,15 @@ class ControlsPanel(QWidget):
             show_plan_map=self.show_plan_map.isChecked(),
             show_plan_passes=self.show_plan_passes.isChecked(),
             show_plan_tips=self.show_plan_tips.isChecked(),
+            tessera_layout=self.tessera_layout.currentData(),
+            tiles_x=int(self.tiles_x.value()),
+            mosaic_colors=int(self.mosaic_colors.value()),
+            tessera_mm=float(self.tessera_mm.value()),
+            grout_frac=self.grout_frac.value(),
+            tessera_jitter=self.tessera_jitter.value(),
+            show_mosaic_preview=self.show_mosaic_preview.isChecked(),
+            show_mosaic_grid=self.show_mosaic_grid.isChecked(),
+            show_mosaic_legend=self.show_mosaic_legend.isChecked(),
             extract_enabled=self.extract_enabled.isChecked(),
             extract_n=int(self.extract_n.value()),
             max_paints=int(self.max_paints.currentData()),
@@ -510,6 +599,15 @@ class ControlsPanel(QWidget):
         self.show_plan_map.setChecked(p.show_plan_map)
         self.show_plan_passes.setChecked(p.show_plan_passes)
         self.show_plan_tips.setChecked(p.show_plan_tips)
+        self._set_combo_data(self.tessera_layout, p.tessera_layout)
+        self.tiles_x.setValue(p.tiles_x)
+        self.mosaic_colors.setValue(p.mosaic_colors)
+        self.tessera_mm.setValue(p.tessera_mm)
+        self.grout_frac.setValue(p.grout_frac)
+        self.tessera_jitter.setValue(p.tessera_jitter)
+        self.show_mosaic_preview.setChecked(p.show_mosaic_preview)
+        self.show_mosaic_grid.setChecked(p.show_mosaic_grid)
+        self.show_mosaic_legend.setChecked(p.show_mosaic_legend)
         self._sync_mode()
         self.extract_enabled.setChecked(p.extract_enabled)
         self.extract_n.setValue(p.extract_n)

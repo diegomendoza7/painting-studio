@@ -49,6 +49,19 @@ PLAN_LAYERS = (
     LAYER_NOTES,
 )
 
+# Mosaic-guide document layers.
+LAYER_MOSAIC_TESSERAE = "mosaic-tesserae"
+LAYER_MOSAIC_GRID = "mosaic-grid"
+LAYER_MOSAIC_LEGEND = "mosaic-legend"
+
+MOSAIC_LAYERS = (
+    LAYER_HEADER,
+    LAYER_MOSAIC_TESSERAE,
+    LAYER_MOSAIC_GRID,
+    LAYER_MOSAIC_LEGEND,
+    LAYER_NOTES,
+)
+
 
 @dataclass
 class Stroke:

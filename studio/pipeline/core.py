@@ -7,10 +7,11 @@ compose-only and recomputes nothing; renaming a paint recomputes nothing
 (names are resolved at compose time); resizing the paper re-costs the washes
 but never re-segments the photo.
 
-The app has two documents and they share this one pipeline. In *board* mode
-the targets come from the photo's dominant colours plus whatever the artist
-picked; in *plan* mode they come from the segmented passages, so the same
-solver produces the recipes either way.
+The app has three documents and they share this one pipeline. Only the target
+list differs: in *board* mode the targets are the photo's dominant colours plus
+whatever the artist picked, in *plan* mode they are the segmented passages, and
+in *mosaic* mode they are the tesserae colour stock. The same solver turns each
+into a recipe from the artist's own paints.
 
 Unlike bargue, the pipeline runs happily with *no source image* — the artist's
 palette plus hand-picked targets already make a valid board. The photo stages
@@ -25,12 +26,14 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 from ..models import MixRecipe, Target, ValueLadder, WashPass
-from ..params import DOC_PLAN, Params
+from ..params import DOC_MOSAIC, DOC_PLAN, Params
 from ..scene import Scene
 from . import (
     board,
     extract as extract_mod,
     ladder as ladder_mod,
+    mosaic_doc,
+    mosaic_grid as mosaic_mod,
     plan_doc,
     plan_regions,
     plan_schedule,
@@ -38,6 +41,7 @@ from . import (
 )
 from .board import BoardLayout
 from .loader import LoadedImage, normalize
+from .mosaic_grid import MosaicGrid
 from .plan_regions import PassageMap
 
 ProgressCB = Optional[Callable[[str, float], None]]
@@ -53,6 +57,7 @@ class Result:
     ladders: Tuple[ValueLadder, ...]
     passage_map: Optional[PassageMap] = None
     passes: Tuple[WashPass, ...] = ()
+    mosaic: Optional[MosaicGrid] = None
     recomputed: List[str] = field(default_factory=list)
 
 
@@ -65,6 +70,7 @@ class Pipeline:
         self._norm = None      # (key, LoadedImage)
         self._extract = None   # (key, Tuple[Target, ...])
         self._passages = None  # (key, Optional[PassageMap])
+        self._mosaic = None    # (key, Optional[MosaicGrid])
         self._solve = None     # (key, Tuple[MixRecipe, ...])
         self._ladder = None    # (key, Tuple[ValueLadder, ...])
         self._schedule = None  # (key, Tuple[WashPass, ...])
@@ -94,6 +100,7 @@ class Pipeline:
     def run(self, params: Params, progress: ProgressCB = None) -> Result:
         recomputed: List[str] = []
         is_plan = params.doc_mode == DOC_PLAN
+        is_mosaic = params.doc_mode == DOC_MOSAIC
 
         def report(label: str, frac: float) -> None:
             if progress:
@@ -118,7 +125,7 @@ class Pipeline:
         extract_key = (norm_key, params.extract_key())
 
         def comp_extract() -> Tuple[Target, ...]:
-            if rgb is None or not params.extract_enabled or is_plan:
+            if rgb is None or not params.extract_enabled or is_plan or is_mosaic:
                 return ()
             report("Extracting photo palette", 0.15)
             return extract_mod.extract_targets(rgb, params.extract_n)
@@ -127,7 +134,7 @@ class Pipeline:
         # status line should name work that actually happened, so board mode
         # never mentions "passages" and plan mode never mentions "ladders".
         auto_targets, self._extract, r = self._cached(self._extract, extract_key, comp_extract)
-        if r and not is_plan:
+        if r and not (is_plan or is_mosaic):
             recomputed.append("extract")
 
         # Stage 1b — segment the photo into value tiers and paintable passages.
@@ -145,12 +152,27 @@ class Pipeline:
         if r and is_plan:
             recomputed.append("passages")
 
+        # Stage 1c — cut the photo into tesserae and reduce them to a colour stock.
+        mosaic_key = (norm_key, params.mosaic_key())
+
+        def comp_mosaic() -> Optional[MosaicGrid]:
+            if rgb is None or not is_mosaic:
+                return None
+            report("Laying tesserae", 0.20)
+            return mosaic_mod.build_mosaic_grid(
+                rgb, params.tiles_x, params.mosaic_colors, params.tessera_layout
+            )
+
+        grid, self._mosaic, r = self._cached(self._mosaic, mosaic_key, comp_mosaic)
+        if r and is_mosaic:
+            recomputed.append("mosaic")
+
         # Stage 2 — solve mixing recipes for all targets.
         #
         # Plan mode solves the passage colours (index-aligned, so passage i is
         # recipe i) and appends anything hand-picked; board mode solves the
         # photo's auto palette plus the picks, as before.
-        solve_key = (extract_key, passage_key, params.solve_key())
+        solve_key = (extract_key, passage_key, mosaic_key, params.solve_key())
 
         def comp_solve() -> Tuple[MixRecipe, ...]:
             manual = tuple(
@@ -161,6 +183,11 @@ class Pipeline:
                 head = tuple(
                     Target(hex=p.target_hex, label=f"Passage {p.id}", source="auto")
                     for p in (pmap.passages if pmap else ())
+                )
+            elif is_mosaic:
+                head = tuple(
+                    Target(hex=c, label=f"Colour {i + 1}", source="auto")
+                    for i, c in enumerate(grid.colors if grid else ())
                 )
             else:
                 head = auto_targets
@@ -177,7 +204,7 @@ class Pipeline:
         ladder_key = (solve_key, params.ladder_key())
 
         def comp_ladders() -> Tuple[ValueLadder, ...]:
-            if is_plan:
+            if is_plan or is_mosaic:
                 return ()
             report("Building value ladders", 0.85)
             return ladder_mod.build_ladders(
@@ -186,7 +213,7 @@ class Pipeline:
             )
 
         ladders, self._ladder, r = self._cached(self._ladder, ladder_key, comp_ladders)
-        if r and not is_plan:
+        if r and not (is_plan or is_mosaic):
             recomputed.append("ladders")
 
         # Stage 4 — order the passages into wash passes.
@@ -209,6 +236,8 @@ class Pipeline:
         report("Composing", 0.95)
         if is_plan:
             scene, layout = plan_doc.build_plan(params, pmap, recipes, passes, rgb)
+        elif is_mosaic:
+            scene, layout = mosaic_doc.build_mosaic(params, grid, recipes, rgb)
         else:
             scene, layout = board.build_board(params, recipes, ladders, rgb, auto_targets)
         report("Done", 1.0)
@@ -222,5 +251,6 @@ class Pipeline:
             ladders=ladders,
             passage_map=pmap,
             passes=passes,
+            mosaic=grid,
             recomputed=recomputed,
         )
