@@ -130,8 +130,12 @@ class MainWindow(QMainWindow):
             "you tape together, then trace or paint straight from it."
         )
         self.act_reset = QAction("Reset", self)
+        self.act_easel = QAction("Easel", self)
+        self.act_easel.setToolTip(
+            "Open the easel: click your reference to see a colour big, with how to mix "
+            "it from your palette. Swatches are saved per painting.")
         for a in (self.act_open, self.act_svg, self.act_png, self.act_pdf,
-                  self.act_grid, self.act_reset):
+                  self.act_grid, self.act_reset, self.act_easel):
             tb.addAction(a)
         self.act_grid.setVisible(False)   # mosaic-only
         self.act_svg.setEnabled(False)
@@ -190,6 +194,7 @@ class MainWindow(QMainWindow):
         self.act_png.triggered.connect(self._export_png)
         self.act_pdf.triggered.connect(self._export_pdf)
         self.act_grid.triggered.connect(self._export_grid)
+        self.act_easel.triggered.connect(self._open_easel)
         self.act_reset.triggered.connect(self._reset)
         self.act_undo.triggered.connect(self._do_undo)
         self.act_redo.triggered.connect(self._do_redo)
@@ -225,10 +230,30 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     # -- session persistence (auto-restore) ---------------------------------
+    def _own_palette(self):
+        """The artist's palette from the library, if they've chosen one."""
+        try:
+            from ..library import Library
+            from .easel_window import library_root
+
+            lib = Library(library_root())
+            name = lib.default_palette_name()
+            return lib.palette(name) if name else None
+        except OSError:
+            return None
+
+    def _with_own_palette(self, params: Params) -> Params:
+        pal = self._own_palette()
+        return params.copy(palette=pal.paints, medium=pal.medium) if pal else params
+
     def _restore_session(self):
         """Reload the last session (photo + params + window state) on launch."""
         state = decode_session(QSettings().value("session/json", "", str))
         if state is None:
+            # First launch: start from the artist's own palette, not a starter kit.
+            self.params = self._with_own_palette(self.params)
+            self.controls.apply(self.params)
+            self.palette_panel.set_palette(self.params.palette)
             return
 
         self.params = state["params"]
@@ -651,6 +676,15 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Export failed", str(exc))
 
+    def _open_easel(self):
+        from .easel_window import EaselWindow
+
+        if getattr(self, "_easel", None) is None:
+            self._easel = EaselWindow()
+        self._easel.show()
+        self._easel.raise_()
+        self._easel.activateWindow()
+
     def _export_grid(self):
         """Write the numbered mosaic grid at true tessera size, tiled across pages."""
         if not self._result or self._result.mosaic is None:
@@ -675,7 +709,8 @@ class MainWindow(QMainWindow):
 
     def _reset(self):
         self._push_history()   # a Reset is undoable
-        self.params = Params()
+        # Reset the settings, not the paints you own: fall back to your palette.
+        self.params = self._with_own_palette(Params())
         self.controls.apply(self.params)
         self.palette_panel.set_palette(self.params.palette)
         self.act_eyedrop.setChecked(False)

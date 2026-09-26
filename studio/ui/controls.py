@@ -304,6 +304,7 @@ class ControlsPanel(QWidget):
         self.max_paints = QComboBox()
         self.max_paints.addItem("2 paints (cleaner)", 2)
         self.max_paints.addItem("3 paints (closer)", 3)
+        self.max_paints.addItem("4 paints (closest — best for greys)", 4)
         self._set_combo_data(self.max_paints, params.max_paints)
         f.addRow("Paints per mix", self.max_paints)
         root.addWidget(g_mix)

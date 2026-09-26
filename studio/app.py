@@ -7,12 +7,18 @@ import sys
 def main() -> int:
     from PySide6.QtWidgets import QApplication
 
-    from .ui.main_window import MainWindow
-
     app = QApplication(sys.argv)
     app.setApplicationName("Painting Studio")
     app.setOrganizationName("Studio")
-    window = MainWindow()
+    if "--easel" in sys.argv[1:]:
+        # Straight to the easel — the window you keep open while painting.
+        from .ui.easel_window import EaselWindow
+
+        window = EaselWindow()
+    else:
+        from .ui.main_window import MainWindow
+
+        window = MainWindow()
     window.show()
     return app.exec()
 

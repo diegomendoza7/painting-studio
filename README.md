@@ -103,11 +103,60 @@ its own footprint. A wider grout is therefore what buys a more hand-cut look.
 The grout itself is floored at a visible minimum, because two wet watercolor
 squares that touch bleed into one.
 
+## Easel — colour matching while you paint
+
+The window you keep open beside the canvas. Open it with the **Easel** button,
+or go straight there:
+
+```bash
+python main.py --easel
+```
+
+- **Click the reference, get the colour big.** A click selects the patch of
+  similar colour you meant — outlined on the photo — and fills the window with
+  its average on a neutral mid-grey surround, the one background that doesn't
+  push a colour warmer, cooler, lighter or darker. Click again to go back.
+  **Option-click** samples a small spot instead; **Size** makes the region
+  smaller or larger than the automatic choice.
+- **What to mix, from your paints.** The recipe as parts, the closest colour
+  your palette actually reaches (shown under the target, with how close it is
+  in words), and numbered steps **in the order that works**: white first for
+  tints (colour goes into white, never the reverse), the strongest pigments —
+  Phthalo, Alizarin — last and a little at a time, because you can't take them
+  back out. Oil and acrylic mixes may use four paints: muted neutrals, which
+  are most of what you mix, usually need white plus a warm, a cool and a
+  modifier.
+- **How much.** From your canvas size and the region's share of the picture:
+  millilitres, a pile you can picture (a pea, a hazelnut, a walnut), and
+  centimetres squeezed from a standard tube — per paint.
+- **V** shows value only, on the swatch and the photo. Value is the part of a
+  colour that's easiest to get wrong and matters most.
+- **History, by painting.** Every swatch is saved as you go, with a crop of
+  where it came from, and can be named, tagged and annotated. Search one
+  painting or all of them by name, notes, tag, paint or painting. **One swatch
+  per area:** clicking an area that's already in the history opens that swatch
+  rather than adding a copy (a different Size setting, or Option-click, still
+  makes a new one).
+- **Named palettes.** Keep several (a full kit, a Zorn limited palette…); each
+  painting remembers which it mixes from. Changing a palette never rewrites an
+  old swatch — **Re-mix** does that when you ask.
+
+Everything lives in `~/Documents/Painting Studio/` as plain JSON and PNG: one
+folder per painting with a *copy* of its reference photo, so moving or deleting
+the original never breaks it. iPhone HEIC photos are converted on import with
+macOS's built-in `sips`.
+
+Keys: **Space** back to the photo · **Esc** back, then clear the selection ·
+**⌘D** clear the selection (so is clicking the margin around the photo) ·
+**V** value · **⌫** delete swatch · **⌘N** new painting · **⌘F** search ·
+**⌃⌘F** full screen.
+
 ## Run
 
 ```bash
 pip install -r requirements.txt
-python main.py
+python main.py            # documents: board, painting plan, mosaic
+python main.py --easel    # straight to the easel
 ```
 
 ## Workflow
@@ -132,8 +181,9 @@ capture the board/solver "look" but never overwrite your palette.
 
 Paint does not mix like light: blue + yellow makes green, not gray. Recipes
 are computed in [Mixbox](https://scrtwpns.com/mixbox)'s pigment latent space
-(Kubelka–Munk based), searching 1–3 paint combinations from your palette for
-the lowest CIEDE2000 distance to the target. Watercolor recipes never use
+(Kubelka–Munk based), searching 1–4 paint combinations from your palette for
+the lowest CIEDE2000 distance to the target. Four-paint mixes are tried on top
+of the best three-paint ones, which keeps a click fast on a large palette. Watercolor recipes never use
 white — lightness comes from dilution over the paper, modeled with
 Beer–Lambert. Oil pastel "recipes" are surface layering orders, since the
 medium mixes on the support, not the palette.

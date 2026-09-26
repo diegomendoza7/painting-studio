@@ -91,6 +91,14 @@ def _load_raster(path: str) -> np.ndarray:
         img.load()
     except Exception as exc:
         raise LoadError(f"Could not read image '{os.path.basename(path)}': {exc}") from exc
+    # Phone photos store their rotation as an EXIF tag rather than in the
+    # pixels; without this a portrait reference loads lying on its side.
+    try:
+        from PIL import ImageOps
+
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001 - a malformed EXIF block must not block loading
+        pass
 
     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
         # Flatten transparency onto white — the board samples color only.

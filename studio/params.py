@@ -51,7 +51,7 @@ class Params:
     manual_targets: Tuple[Target, ...] = ()
 
     # --- mix solver ----------------------------------------------------------
-    max_paints: int = 3             # paints per mix: 2 | 3
+    max_paints: int = 3             # paints per mix: 2 | 3 | 4
 
     # --- value ladder --------------------------------------------------------
     ladder_steps: int = 5           # 5..7 steps light -> dark

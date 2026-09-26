@@ -1,7 +1,7 @@
 """Stage 2 — solve mixing recipes: target color -> paints + proportions.
 
 For brush media (oil, acrylic, watercolor) the solver searches combinations of
-1-3 palette paints, mixed in Mixbox's pigment latent space, for the weights
+1-4 palette paints, mixed in Mixbox's pigment latent space, for the weights
 that minimize CIEDE2000 to the target. Watercolor never mixes with white —
 each candidate is instead *diluted* (Beer-Lambert over paper white) to match
 the target's lightness before scoring. Oil pastel doesn't mix on a palette at
@@ -25,11 +25,30 @@ from ..models import MixRecipe, MixStep, Paint, Target
 ACHIEVABLE_DE = 6.0
 
 _PAIR_GRID = tuple(w / 10.0 for w in range(1, 10))            # 0.1 .. 0.9
-_TRIPLE_GRID = tuple(                                          # simplex, step 0.2, each >= 0.2
+# The full simplex at step 0.1, every weight >= 0.1 — symmetric, so no slot is
+# capped. The earlier grid capped whichever paint came first in the palette at
+# 60%, and since the palette lists Titanium White first, a three-paint oil tint
+# could never be mostly white: a light grey came back as yellow + blue + red with
+# no white at all.
+_TRIPLE_GRID = tuple(
     (a / 10.0, b / 10.0, (10 - a - b) / 10.0)
-    for a in range(2, 7)
-    for b in range(2, 9 - a + 1)
+    for a in range(1, 9)
+    for b in range(1, 10 - a)
 )
+# Four-paint mixes: every weight >= 0.1 in 0.1 steps. Neutrals are where a
+# fourth paint earns its place — a muted grey wants white plus a warm and a cool
+# plus a modifier, and on the oil starter palette three paints can't get closer
+# than ΔE ~8 to an ordinary mid grey while four reach ~2.
+_QUAD_GRID = tuple(
+    (a / 10.0, b / 10.0, c / 10.0, (10 - a - b - c) / 10.0)
+    for a in range(1, 8)
+    for b in range(1, 9 - a)
+    for c in range(1, 10 - a - b)
+)
+# Four-paint combinations grow fast (a 15-tube palette has 1,365), so a fourth
+# paint is only tried on top of the best three-paint mixes. That keeps a click
+# at the easel well under a tenth of a second on any real palette.
+_QUAD_SEEDS = 20
 _TOP_K = 10
 _MIN_W = 0.05
 _PASTEL_DOMINANCE = (0.5, 0.65, 0.8)
@@ -97,7 +116,7 @@ def _round_weights(weights: Sequence[float]) -> Tuple[float, ...]:
 def _solve_brush(
     target_rgb: RGB, paints: Sequence[Tuple[int, Paint, tuple]], max_paints: int, dilutes: bool
 ) -> Tuple[Tuple[int, ...], Tuple[float, ...], float, RGB, float]:
-    """Search singles/pairs/triples; returns (paint indices, weights, dE, rgb, dilution)."""
+    """Search 1–4 paint mixes; returns (paint indices, weights, dE, rgb, dilution)."""
     target_lab = lab(target_rgb)
     # Candidate = (dE, n_paints, indices, weights, rgb, dilution); ordering on
     # the first four keeps every comparison deterministic.
@@ -117,6 +136,17 @@ def _solve_brush(
         for i, j, k in itertools.combinations(range(len(paints)), 3):
             for w in _TRIPLE_GRID:
                 consider((i, j, k), w)
+    if max_paints >= 4 and len(paints) >= 4:
+        seeds = sorted((c for c in cands if c[1] == 3), key=lambda c: c[:4])[:_QUAD_SEEDS]
+        tried = set()
+        for seed in seeds:
+            for extra in range(len(paints)):
+                idxs = tuple(sorted(seed[2] + (extra,)))
+                if extra in seed[2] or idxs in tried:
+                    continue
+                tried.add(idxs)
+                for w in _QUAD_GRID:
+                    consider(idxs, w)
 
     cands.sort(key=lambda c: c[:4])
     best = cands[0]
@@ -143,15 +173,17 @@ def _refine(cand: tuple, paints, target_lab: tuple, dilutes: bool) -> tuple:
                 cand2 = (round(de2, 6), n, idxs, (w, 1.0 - w), rgb2, d2)
                 if cand2[:4] < best[:4]:
                     best = cand2
-    elif n == 3:
+    elif n >= 3:
+        # Coordinate refinement over the first n-1 weights; the last takes the
+        # remainder, so the weights always sum to one.
         for step in (0.025, 0.00625):
-            for coord in (0, 1):
+            for coord in range(n - 1):
                 w = list(best[3])
                 for k in range(-3, 4):
                     trial = list(w)
                     trial[coord] = max(_MIN_W, w[coord] + k * step)
-                    trial[2] = 1.0 - trial[0] - trial[1]
-                    if trial[2] < _MIN_W:
+                    trial[-1] = 1.0 - sum(trial[:-1])
+                    if trial[-1] < _MIN_W:
                         continue
                     tw = tuple(trial)
                     de2, rgb2, d2 = _score(latents, tw, target_lab, dilutes)

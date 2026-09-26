@@ -19,6 +19,8 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Keep every library the suite creates out of ~/Documents/Painting Studio.
+os.environ["PAINTING_STUDIO_LIBRARY"] = tempfile.mkdtemp(prefix="studio-smoke-lib-")
 
 from studio import color  # noqa: E402
 from studio import mixer  # noqa: E402
@@ -1291,6 +1293,439 @@ def group28_mosaic_cartoon():
         check(sheet.width > 0 and sheet.height > 0, f"the {name} sheet has a size")
 
 
+# --- easel mode ------------------------------------------------------------------------
+def group29_easel_picking():
+    print("\n[29] Easel — picking a region")
+    from studio import easel
+
+    img = make_plan_scene()             # four horizontal bands, 300 x 400
+    an = easel.prepare(img)
+    check(an.shape[0] > 0 and an.lab.shape[:2] == an.shape, "the reference is prepared once")
+    # Clicking inside the second band selects that band — not a speck, not the picture.
+    pk = easel.pick_region(an, 0.5, 0.375)
+    check(0.18 < pk.area_frac < 0.32, f"a click selects its band ({pk.area_frac * 100:.0f}%)")
+    band = np.array(PLAN_BANDS[1], dtype=np.float64)
+    de = color.delta_e_2000(color.lab(tuple(int(v) for v in band)), color.lab(color.hex_to_rgb(pk.hex)))
+    check(de < 3.0, f"the swatch is that band's colour (ΔE {de:.1f})")
+    h, w = an.shape
+    check(bool(pk.mask[int(0.375 * h), int(0.5 * w)]), "the region contains the click")
+    edge = easel.region_outline(pk.mask)
+    check(bool(edge.any()) and not (edge & ~pk.mask).any(), "the outline lies on the region")
+    # It never leaks into a neighbouring band of a clearly different colour.
+    other = pk.mask[: int(0.22 * h)].mean() + pk.mask[int(0.53 * h):].mean()
+    check(other < 0.01, "the region stops at the band's edges")
+    # Smaller / larger step monotonically, and a saved tolerance reproduces the pick.
+    blob = easel.prepare(make_blob_scene())
+    sizes = [easel.pick_region(blob, 0.5, 0.5, bias=b).area_frac for b in (-3, 0, 3)]
+    check(sizes[0] <= sizes[1] <= sizes[2], f"region size follows the bias ({sizes})")
+    again = easel.pick_region(an, 0.5, 0.375, tolerance=pk.tolerance)
+    check(np.array_equal(again.mask, pk.mask), "a saved tolerance redraws the same outline")
+    # The auto rule stays out of specks and out of leaks.
+    check(easel.natural_index([0.0001, 0.0002, 0.05, 0.06, 0.07, 0.4] + [0.5] * 9) >= 2,
+          "auto grows out of a speck")
+    idx = easel.natural_index([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.30] + [0.5] * 7)
+    check(idx <= 6, f"auto steps back out of a leak (chose step {idx})")
+    # A spot is small and centred on the click.
+    sp = easel.pick_spot(an, 0.5, 0.375)
+    check(sp.area_frac < 0.01, f"a spot is a small circle ({sp.area_frac * 100:.2f}%)")
+    check(sp.tolerance == 0.0, "a spot carries no tolerance")
+    crop = easel.crop_around(img, pk.x, pk.y, pk.bbox)
+    check(crop.shape == (128, 128, 3), "the history thumbnail is a square crop")
+    # Describing a colour in painter's terms.
+    # One swatch per area: the same patch re-picked matches; a different one doesn't.
+    from types import SimpleNamespace as NS
+    saved = NS(pick="region", hex=pk.hex, x=pk.x, y=pk.y, area_frac=pk.area_frac,
+               tolerance=pk.tolerance, bias=0)
+    again2 = easel.pick_region(an, 0.52, 0.36)                # another click, same band
+    check(easel.find_same(an, again2, False, 0, [saved]) is saved,
+          "a second click in the same band is the same area")
+    other_band = easel.pick_region(an, 0.5, 0.875)
+    check(easel.find_same(an, other_band, False, 0, [saved]) is None,
+          "a different band is a different area")
+    check(easel.find_same(an, sp, True, 0, [saved]) is None, "a spot never duplicates a region")
+    check(easel.find_same(an, easel.pick_region(an, 0.52, 0.36, bias=2), False, 2, [saved]) is None,
+          "a deliberate Size change makes its own swatch")
+    saved_spot = NS(pick="spot", hex=sp.hex, x=sp.x, y=sp.y, area_frac=sp.area_frac,
+                    tolerance=0.0, bias=0)
+    check(easel.find_same(an, easel.pick_spot(an, 0.501, 0.376), True, 0, [saved_spot]) is saved_spot,
+          "a spot a pixel away is the same spot")
+    check(easel.find_same(an, easel.pick_spot(an, 0.2, 0.376), True, 0, [saved_spot]) is None,
+          "a spot across the band is a different spot")
+    # Overlap, not size: a re-click that regrows over a smaller part of the same
+    # patch is still that patch.
+    half = easel.Pick(hex=pk.hex, mask=pk.mask & (np.arange(pk.mask.shape[1])[None, :] < pk.mask.shape[1] // 3),
+                      area_frac=0.0, x=pk.x, y=pk.y, bbox=pk.bbox)
+    check(easel.same_area(half, False, saved, pk.mask), "a smaller region inside the same patch matches")
+    names = ["Swatch 7", "Swatch 6", "Swatch 5", "Swatch 4", "Swatch 3", "Swatch 1"]
+    check(easel.next_swatch_name(names) == "Swatch 8",
+          "a new swatch never reuses a name after a delete")
+    check(easel.next_swatch_name(["cheek", "Swatch 2"]) == "Swatch 3", "renamed swatches are skipped")
+    check(easel.next_swatch_name([]) == "Swatch 1", "the first swatch is Swatch 1")
+    check("near-grey" in easel.describe("#777777"), "a mid grey is described as near-grey")
+    check("warm" in easel.describe("#c0703a"), "an orange is described as warm")
+    L, v = easel.value_of("#ffffff")
+    check(v == 10 and abs(L - 100) < 0.5, "white is value 10")
+    g = easel.grey_of("#c0703a")
+    check(abs(color.lstar(color.hex_to_rgb(g)) - color.lstar(color.hex_to_rgb("#c0703a"))) < 1.0,
+          "value mode keeps the colour's value")
+
+
+def group30_easel_amounts():
+    print("\n[30] Easel — how much to mix")
+    from studio import easel
+
+    check(abs(easel.canvas_cm2(10, 10, "cm") - 100.0) < 1e-9, "canvas area in cm")
+    check(abs(easel.canvas_cm2(1, 1, "in") - 2.54 ** 2) < 1e-9, "canvas area in inches")
+    check(easel.canvas_cm2(0, 20, "in") == 0.0, "an unset canvas has no area")
+    area = easel.canvas_cm2(16, 20, "in")
+    small, big = easel.amount_ml(0.02, area), easel.amount_ml(0.2, area)
+    check(big > small, "a bigger region needs more paint")
+    check(easel.amount_ml(0.2, area * 2) > big, "a bigger canvas needs more paint")
+    check(easel.amount_ml(0.0001, area) == easel.MIN_ML, "a tiny region still gets a mixable pea")
+    check(easel.amount_ml(0.2, 0.0) == 0.0, "no canvas size means no invented amount")
+    piles = [easel.pile_phrase(ml) for ml in (0.3, 1.5, 5, 15, 40)]
+    check(piles == ["about a pea", "about a hazelnut", "about a walnut", "about a golf ball",
+                    "more than a golf ball — mix it in two batches"], f"piles scale up ({piles})")
+    check(easel.tube_text(0.05) == "a tiny touch", "a tiny share reads as a touch")
+    check(easel.tube_text(1.0) == "4 cm", f"1 ml is 4 cm of tube ({easel.tube_text(1.0)})")
+    ml, text = easel.amount_summary("oil", 0.1, area)
+    check(ml > 0 and "ml" in text and "tube" in text and "10% of the canvas" in text,
+          f"the oil amount speaks in piles and tube ({text})")
+    _ml, unset = easel.amount_summary("oil", 0.1, 0.0)
+    check("canvas size" in unset, "an unset canvas asks for its size")
+    wml, wtext = easel.amount_summary("watercolor", 0.1, area)
+    check(wml > 0 and "brush-load" in wtext, "watercolor amounts reuse the wash volumes")
+    check(easel.amount_summary("oilpastel", 0.1, area) == (0.0, ""), "oil pastel has no amount")
+    check(easel.paints_per_mix("oil") == 4 and easel.paints_per_mix("watercolor") == 3,
+          "oil mixes may use four paints, watercolor three")
+
+
+def group31_easel_mixing_order():
+    print("\n[31] Easel — mixing order")
+    from studio import easel
+    from studio.models import MixRecipe, MixStep
+
+    by = {p.name: p for p in OIL_STARTER}
+
+    def recipe(*parts):
+        return MixRecipe("#888888", "", tuple(MixStep(n, by[n].hex, w) for n, w in parts),
+                         "#888888", 1.0)
+
+    # White-dominant: colour goes into white.
+    r = recipe(("Yellow Ochre", 0.10), ("Titanium White", 0.85), ("Ultramarine Blue", 0.05))
+    order = [s.paint_name for s in easel.ordered_steps(r, OIL_STARTER)]
+    check(order[0] == "Titanium White", f"a tint starts from the white ({order})")
+    steps = easel.mixing_steps(r, OIL_STARTER, "oil", 4.0)
+    check("add colour to it" in steps[0], "the first step says colour goes into white")
+    # A strong pigment is never the base, however big its share.
+    r = recipe(("Phthalo Blue", 0.45), ("Cadmium Red Light", 0.30),
+               ("Titanium White", 0.15), ("Cadmium Yellow Light", 0.10))
+    order = [s.paint_name for s in easel.ordered_steps(r, OIL_STARTER)]
+    check(order[0] != "Phthalo Blue", f"Phthalo never starts a mix ({order})")
+    check(order[-1] == "Phthalo Blue", "the strong pigment goes in last")
+    steps = easel.mixing_steps(r, OIL_STARTER, "oil", 3.5)
+    check(any("strong pigment" in s and "Phthalo" in s for s in steps),
+          "the Phthalo step warns it is strong")
+    check(any("touch of Cadmium Yellow" in s for s in steps),
+          "a small share is a touch — without being called strong")
+    check(not any("Cadmium Yellow" in s and "strong" in s for s in steps),
+          "a small share is not mislabelled as strong")
+    check(steps[-1].startswith("Check it against the swatch"), "every mix ends with a check")
+    # Amounts add up to the total.
+    import re
+    cms = [float(m) for s in steps for m in re.findall(r"([0-9.]+) cm", s)]
+    check(abs(sum(cms) * easel.TUBE_ML_PER_CM - 3.5) < 0.6, f"step amounts sum to the total ({cms})")
+    # Without a canvas size the steps fall back to parts.
+    steps = easel.mixing_steps(r, OIL_STARTER, "oil", 0.0)
+    check(any("parts" in s or "part " in s for s in steps), "no canvas size → parts, not cm")
+    # One paint, watercolor and pastel all read correctly.
+    single = recipe(("Yellow Ochre", 1.0))
+    check(easel.mixing_steps(single, OIL_STARTER, "oil", 2.0)[0].startswith("Use Yellow Ochre straight"),
+          "a single paint is used straight from the tube")
+    wr = MixRecipe("#aaaaaa", "", (MixStep("French Ultramarine", WATERCOLOR_STARTER[8].hex, 1.0),),
+                   "#aaaaaa", 1.0, dilution=0.3)
+    wsteps = easel.mixing_steps(wr, WATERCOLOR_STARTER, "watercolor", 5.0)
+    check(any("wash" in s for s in wsteps), "watercolor steps speak in washes")
+    # A renamed paint is named by its current name.
+    renamed = tuple(Paint("My Blue", q.hex, q.is_white, q.opacity, q.staining, q.granulating)
+                    if q.name == "Phthalo Blue" else q for q in OIL_STARTER)
+    r = recipe(("Phthalo Blue", 0.45), ("Cadmium Red Light", 0.55))
+    check(any("My Blue" in s for s in easel.mixing_steps(r, renamed, "oil", 2.0)),
+          "steps use the paint's current name")
+
+
+def group32_library():
+    print("\n[32] Easel — the library on disk")
+    from studio import easel
+    from studio.library import Library, NamedPalette, Swatch, new_swatch_id, palette_or_first
+
+    with tempfile.TemporaryDirectory() as td:
+        lib = Library(td)
+        pals = lib.palettes()
+        check("Oil — split primary 8" in pals and len(pals) == 4, "a fresh library has the starter palettes")
+        check(pals["Oil — split primary 8"].paints == OIL_STARTER, "starter palettes are the real kits")
+        mine = NamedPalette("Zorn limited", "oil", OIL_STARTER[:4])
+        lib.save_palette(mine)
+        check(Library(td).palette("Zorn limited").paints == OIL_STARTER[:4], "a saved palette persists")
+        check(lib.default_palette_name() == "", "no palette is 'yours' until you choose one")
+        lib.set_default_palette("Zorn limited")
+        check(Library(td).default_palette_name() == "Zorn limited", "your palette is remembered")
+        lib.save_palette(NamedPalette("Another", "oil", OIL_STARTER[:2]))
+        check(lib.default_palette_name() == "Zorn limited", "saving another palette keeps yours")
+
+        ref = os.path.join(td, "photo.png")
+        from PIL import Image
+        Image.fromarray(make_plan_scene()).save(ref)
+        proj = lib.create_project("Lemons", "Zorn limited", ref, 40, 50, "cm")
+        check(os.path.isfile(lib.reference_path(proj)), "the reference is copied into the painting")
+        os.remove(ref)
+        check(os.path.isfile(lib.reference_path(Library(td).load_project(proj.id))),
+              "deleting the original photo doesn't break the painting")
+
+        an = easel.prepare(make_plan_scene())
+        pk = easel.pick_region(an, 0.5, 0.375)
+        from studio.pipeline.solver import solve_targets
+        r = solve_targets([Target(hex=pk.hex)], OIL_STARTER[:4], "oil", 4)[0]
+        sw = Swatch(id=new_swatch_id(), hex=pk.hex, x=pk.x, y=pk.y, area_frac=pk.area_frac,
+                    recipe=r, palette="Zorn limited", medium="oil", tolerance=pk.tolerance,
+                    name="sky", notes="needs more ochre", tags=("background",))
+        lib.add_swatch(proj, sw, easel.crop_around(make_plan_scene(), pk.x, pk.y, pk.bbox))
+        back = Library(td).load_project(proj.id)
+        got = back.swatch(sw.id)
+        check(got is not None and got.recipe == r, "a swatch's recipe survives a restart exactly")
+        check((got.name, got.notes, got.tags) == ("sky", "needs more ochre", ("background",)),
+              "name, notes and tags survive a restart")
+        check((back.canvas_w, back.canvas_h, back.units) == (40.0, 50.0, "cm"), "the canvas survives")
+        check(lib.crop_path(back, got) is not None, "the crop is saved beside it")
+        check(not [f for f in os.listdir(back.path) if ".tmp-" in f], "no temp files are left behind")
+
+        # A second painting, and searching across them.
+        other = lib.create_project("Portrait", "Oil — split primary 8")
+        lib.add_swatch(other, Swatch(id=new_swatch_id(), hex="#c9a38a", x=0.5, y=0.5, area_frac=0.1,
+                                     recipe=r, palette="Oil — split primary 8", medium="oil",
+                                     name="cheek light"))
+        check([s.name for _p, s in lib.search("cheek")] == ["cheek light"], "search finds by name")
+        check(len(lib.search("ochre")) == 1, "search finds by notes")
+        check(len(lib.search("background")) == 1, "search finds by tag")
+        check(len(lib.search("lemons")) == 1, "search finds by painting")
+        paint = r.steps[0].paint_name
+        check(len(lib.search(paint)) == 2, "search finds by paint across paintings")
+        check(len(lib.search("", proj.id)) == 1, "a painting's history holds only its own swatches")
+        check([p.name for p in lib.projects()][0] == "Portrait", "the latest painting is listed first")
+
+        # Palettes may go away; swatches keep their recipe, lookups fall back.
+        lib.delete_palette("Zorn limited")
+        check(lib.default_palette_name() == "", "deleting your palette clears the choice cleanly")
+        check(Library(td).load_project(proj.id).swatches[0].recipe == r,
+              "deleting a palette leaves old recipes alone")
+        check(palette_or_first(lib, "Zorn limited", "oil").medium == "oil",
+              "a deleted palette falls back to one of the same medium")
+
+        # Deleting cleans up, and only ever touches real paintings.
+        lib.delete_swatch(proj, sw.id)
+        check(not os.listdir(os.path.join(proj.path, "crops")), "deleting a swatch removes its crop")
+        stray = os.path.join(lib.projects_dir, "not-a-painting")
+        os.makedirs(stray)
+        lib.delete_project("not-a-painting")
+        check(os.path.isdir(stray), "a folder without project.json is never deleted")
+        with open(os.path.join(stray, "project.json"), "w") as fh:
+            fh.write("{ broken")
+        check(len(lib.projects()) == 2, "a damaged painting never hides the others")
+        lib.delete_project(other.id)
+        check(not os.path.exists(other.path), "deleting a painting removes its folder")
+
+
+def group33_solver_four_paints():
+    print("\n[33] Solver — four-paint mixes and the symmetric grid")
+    from studio.pipeline import solver
+
+    firsts = {a for a, _b, _c in solver._TRIPLE_GRID}
+    check(max(firsts) >= 0.8, "no slot of a three-paint mix is capped at 60%")
+    check(all(abs(sum(w) - 1.0) < 1e-9 for w in solver._TRIPLE_GRID + solver._QUAD_GRID),
+          "every grid point sums to one")
+    # Light tints: white can finally dominate a three-paint oil mix.
+    r = solve_targets([Target(hex="#d7d0c5")], OIL_STARTER, "oil", 3)[0]
+    white = sum(s.weight for s in r.steps if s.paint_name == "Titanium White")
+    check(white >= 0.7, f"a light tint is mostly white ({white:.2f})")
+    # Neutrals: a fourth paint closes the gap.
+    for hx in ("#998f81", "#b3a89a"):
+        r3 = solve_targets([Target(hex=hx)], OIL_STARTER, "oil", 3)[0]
+        r4 = solve_targets([Target(hex=hx)], OIL_STARTER, "oil", 4)[0]
+        check(r4.delta_e < r3.delta_e - 2.0 and r4.delta_e < 3.5,
+              f"four paints reach the grey {hx} (ΔE {r3.delta_e:.1f} → {r4.delta_e:.1f})")
+        check(len(r4.steps) <= 4, "a four-paint recipe uses at most four paints")
+    again = solve_targets([Target(hex="#998f81")], OIL_STARTER, "oil", 4)[0]
+    check(again == solve_targets([Target(hex="#998f81")], OIL_STARTER, "oil", 4)[0],
+          "four-paint solving is deterministic")
+
+
+def group34_easel_window():
+    print("\n[34] Easel — the window")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtCore import QSettings
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("StudioSmokeTest")
+    app.setApplicationName("StudioSmokeTest")
+    QSettings().clear()
+    from studio.library import Library
+    from studio.ui.easel_window import EaselWindow
+
+    with tempfile.TemporaryDirectory() as td:
+        lib = Library(td)
+        empty = EaselWindow(library=lib)
+        check(empty.project is None and empty.canvas.mode == "empty",
+              "an empty library asks for a first painting")
+        empty.close()
+
+        ref = os.path.join(td, "ref.png")
+        from PIL import Image
+        Image.fromarray(make_plan_scene()).save(ref)
+        proj = lib.create_project("Bands", "Oil — split primary 8", ref, 16, 20, "in")
+        win = EaselWindow(library=lib)
+        win.resize(1200, 800)
+        win.show()
+        app.processEvents()
+        check(win.project is not None and win.project.id == proj.id, "the painting opens")
+        check(win.canvas.mode == "photo" and win.analysis is not None, "the reference is shown")
+
+        # Click -> a big swatch, saved as you go.
+        win._on_picked(0.5, 0.375, False)
+        app.processEvents()
+        check(win.canvas.mode == "swatch", "a click shows the colour big")
+        saved = Library(td).load_project(proj.id)
+        check(len(saved.swatches) == 1, "the swatch is saved to disk immediately")
+        sw = saved.swatches[0]
+        check(sw.recipe is not None and sw.palette == "Oil — split primary 8",
+              "it carries the recipe and the palette it was mixed with")
+        check(lib.crop_path(saved, sw) is not None, "and a crop of where it came from")
+        card = win.canvas._card
+        check(card.ratio_text and card.steps and "ml" in card.amount_text,
+              "the card shows the ratio, the steps and the amount")
+        check(win.history.count() == 1, "the history lists it")
+
+        # Click again -> back to the photo, region still outlined.
+        win._back_to_photo()
+        check(win.canvas.mode == "photo" and win.canvas._overlay is not None,
+              "going back shows the photo with the region outlined")
+
+        # The same area again opens the existing swatch — no copy.
+        first_id = win.current
+        win._on_picked(0.51, 0.37, False)
+        check(len(Library(td).load_project(proj.id).swatches) == 1,
+              "clicking the same area again doesn't add a copy")
+        check(win.canvas.mode == "swatch" and win.current == first_id,
+              "it shows the swatch that's already there")
+        win._back_to_photo()
+
+        # Clearing the selection: Esc from the photo, ⌘D, or the margin.
+        win._escape()
+        check(not win.canvas.has_region and win.current is None,
+              "Esc on the photo clears the selection — no dimming")
+        check(win.history.currentRow() == -1 and win.name_edit.text() == "",
+              "and nothing is selected in the history")
+        win._on_history_clicked(win.history.item(0))
+        win._escape()
+        check(win.canvas.mode == "photo" and win.canvas.has_region,
+              "Esc from a swatch steps back to the photo first")
+        win.act_clear.trigger()
+        check(not win.canvas.has_region, "Clear Selection (⌘D) clears it")
+        win._on_history_clicked(win.history.item(0))
+        win._back_to_photo()
+        win.canvas.deselected.emit()
+        check(not win.canvas.has_region, "clicking the margin around the photo clears it")
+        # Option-click samples a spot.
+        win._on_picked(0.5, 0.375, True)
+        spot = win.project.swatches[0]
+        check(spot.pick == "spot" and spot.area_frac < 0.01, "Option-click samples a small spot")
+        win._back_to_photo()
+
+        # Value mode.
+        win.act_value.setChecked(True)
+        check(win.canvas._value and win.canvas._photo_grey is not None, "V shows value only")
+        win.act_value.setChecked(False)
+
+        # Naming, tags, notes persist.
+        item = win.history.item(1)
+        win._on_history_clicked(item)
+        win.name_edit.setText("sky band")
+        win.tags_edit.setText("background, cool")
+        win.notes_edit.setPlainText("glaze later")
+        win._save_details()
+        named = Library(td).load_project(proj.id).swatch(win.current)
+        check(named.name == "sky band" and named.tags == ("background", "cool")
+              and named.notes == "glaze later", "name, tags and notes are saved")
+        # Notes typed without leaving the field survive switching swatch.
+        win.notes_edit.setPlainText("glaze later, thinly")
+        win._on_history_clicked(win.history.item(0))
+        check(Library(td).load_project(proj.id).swatch(named.id).notes == "glaze later, thinly",
+              "a half-typed note is kept when you move to another swatch")
+
+        # Search.
+        win.search.setText("sky")
+        check(win.history.count() == 1, "search narrows the history")
+        win.search.setText("")
+
+        # Changing the palette leaves old recipes alone until re-mixed.
+        win.palette_combo.setCurrentText("Acrylic — basic 6")
+        check(Library(td).load_project(proj.id).palette == "Acrylic — basic 6",
+              "the painting remembers its palette")
+        before = win.project.swatch(named.id).recipe
+        win._on_history_clicked(next(win.history.item(i) for i in range(win.history.count())
+                                     if win.history.item(i).data(0x0100)[1] == named.id))
+        check(win.project.swatch(named.id).recipe == before, "old swatches keep their recipe")
+        win._remix()
+        remixed = Library(td).load_project(proj.id).swatch(named.id)
+        check(remixed.palette == "Acrylic — basic 6", "Re-mix uses the current palette")
+
+        # Editing the palette saves it to the library.
+        paints = list(win.palette_panel.palette())
+        paints[0] = Paint("Studio White", paints[0].hex, paints[0].is_white, paints[0].opacity)
+        win._on_palette_edited(tuple(paints))
+        check(Library(td).palette("Acrylic — basic 6").paints[0].name == "Studio White",
+              "palette edits are saved")
+
+        # Deleting (confirmation answered yes).
+        original = QMessageBox.question
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        try:
+            n = len(win.project.swatches)
+            win._delete_current()
+        finally:
+            QMessageBox.question = original
+        check(len(Library(td).load_project(proj.id).swatches) == n - 1, "delete removes the swatch")
+        check(win.canvas.mode == "photo", "and returns to the photo")
+
+        # All paintings.
+        other = lib.create_project("Second", "Oil — split primary 8", None)
+        win._reload_projects(select=proj.id)
+        win.scope.setCurrentIndex(1)
+        check(win.history.count() == len(win.project.swatches), "all-paintings scope lists everything")
+        win.close()
+
+    # Your palette carries into the main window: first launch and Reset.
+    from studio.library import NamedPalette
+    envlib = Library(os.environ["PAINTING_STUDIO_LIBRARY"])
+    envlib.save_palette(NamedPalette("Test mine", "oil", OIL_STARTER[:3]))
+    envlib.set_default_palette("Test mine")
+    QSettings().clear()
+    from studio.ui.main_window import MainWindow
+    mw = MainWindow()
+    check(mw.params.palette == OIL_STARTER[:3], "a first launch starts from your palette")
+    check(mw.palette_panel.palette() == OIL_STARTER[:3], "and the palette panel shows it")
+    mw.params = mw.params.copy(palette=OIL_STARTER)
+    mw._reset()
+    check(mw.params.palette == OIL_STARTER[:3], "Reset falls back to your palette, not a starter kit")
+    ew = EaselWindow(library=envlib)
+    check(ew.palette.name == "Test mine", "the easel starts from your palette")
+    ew.close()
+    mw._thread.quit()
+    mw._thread.wait(3000)
+    envlib.set_default_palette("")       # leave the shared test library neutral
+    QSettings().clear()
+
+
 def main() -> int:
     group1_color_math()
     group2_mixer()
@@ -1320,6 +1755,12 @@ def main() -> int:
     group26_mosaic_cache()
     group27_mosaic_andamento()
     group28_mosaic_cartoon()
+    group29_easel_picking()
+    group30_easel_amounts()
+    group31_easel_mixing_order()
+    group32_library()
+    group33_solver_four_paints()
+    group34_easel_window()
 
     print(f"\n{'=' * 60}")
     if _failures:
