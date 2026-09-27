@@ -132,6 +132,17 @@ class Pick:
     y: float
     bbox: Tuple[float, float, float, float]   # normalized x0, y0, x1, y1
     tolerance: float = 0.0                # what the region was grown at (0 for a spot)
+    kind: str = "region"                  # "region" | "spot" | "pixel"
+    image_shape: Tuple[int, int] = (0, 0) # (h, w) the pixel was read from (pixel picks)
+
+
+# The three ways to pick. A region and a spot are averages; a pixel is exact.
+KIND_REGION = "region"
+KIND_SPOT = "spot"
+KIND_PIXEL = "pixel"
+# Two pixel picks this close (in pixels of the image they were read from) are
+# the same place — nobody re-clicks the exact same pixel by hand.
+PIXEL_SAME_PX = 2.0
 
 
 def _to_px(an: Analysis, x: float, y: float) -> Tuple[int, int]:
@@ -178,6 +189,7 @@ def _finish(an: Analysis, mask: np.ndarray, x: float, y: float, tolerance: float
         y=float(y),
         bbox=(x0 / w, y0 / h, x1 / w, y1 / h),
         tolerance=float(tolerance),
+        kind=KIND_REGION,
     )
 
 
@@ -255,7 +267,48 @@ def pick_spot(an: Analysis, x: float, y: float, radius_frac: float = SPOT_FRAC) 
     r = max(1.0, radius_frac * math.hypot(h, w))
     yy, xx = np.mgrid[0:h, 0:w]
     mask = (yy - sy) ** 2 + (xx - sx) ** 2 <= r * r
-    return _finish(an, mask, x, y)
+    pk = _finish(an, mask, x, y)
+    pk.kind = KIND_SPOT
+    return pk
+
+
+def pixel_at(rgb: np.ndarray, x: float, y: float) -> Tuple[int, int]:
+    """(row, col) of the pixel under a normalized point."""
+    h, w = rgb.shape[:2]
+    return min(h - 1, max(0, int(y * h))), min(w - 1, max(0, int(x * w)))
+
+
+def pick_pixel(an: Analysis, rgb: np.ndarray, x: float, y: float) -> Pick:
+    """The exact colour of one pixel — an eyedropper, no averaging at all.
+
+    Read from ``rgb``, the full-resolution image on screen, not the downsampled
+    analysis copy (whose every pixel is already an average of several). The
+    mask marks the one analysis pixel it falls in, so the rest of the easel can
+    treat it like any other pick.
+    """
+    iy, ix = pixel_at(rgb, x, y)
+    h, w = rgb.shape[:2]
+    ah, aw = an.shape
+    mask = np.zeros((ah, aw), dtype=bool)
+    sy, sx = _to_px(an, x, y)
+    mask[sy, sx] = True
+    return Pick(
+        hex=rgb_to_hex(tuple(int(c) for c in rgb[iy, ix])),
+        mask=mask,
+        area_frac=1.0 / float(h * w),
+        x=float(x),
+        y=float(y),
+        bbox=(ix / w, iy / h, (ix + 1) / w, (iy + 1) / h),
+        kind=KIND_PIXEL,
+        image_shape=(h, w),
+    )
+
+
+def loupe_patch(rgb: np.ndarray, x: float, y: float, half: int = 7) -> np.ndarray:
+    """The ``(2*half+1)`` square of pixels around a point, edge-padded — what the loupe magnifies."""
+    iy, ix = pixel_at(rgb, x, y)
+    padded = np.pad(rgb, ((half, half), (half, half), (0, 0)), mode="edge")
+    return padded[iy:iy + 2 * half + 1, ix:ix + 2 * half + 1]
 
 
 def region_outline(mask: np.ndarray) -> np.ndarray:
@@ -514,39 +567,65 @@ def _overlap(a: np.ndarray, b: np.ndarray) -> float:
     return float((a & b).sum()) / smaller if smaller else 0.0
 
 
-def same_area(pick: Pick, spot: bool, swatch, saved_mask: np.ndarray, bias: int = 0) -> bool:
-    """Whether ``pick`` re-selects the area an existing ``swatch`` already holds.
+def _kind_of(swatch) -> str:
+    return getattr(swatch, "pick", KIND_REGION) or KIND_REGION
 
-    ``saved_mask`` is the swatch's region redrawn on the current reference.
-    ``swatch`` only needs ``pick``, ``hex`` and ``bias``.
+
+def same_area(pick: Pick, kind: str, swatch, saved_mask: Optional[np.ndarray], bias: int = 0) -> bool:
+    """Whether ``pick`` re-selects what an existing ``swatch`` already holds.
+
+    Regions and spots compare the pixels they cover — ``saved_mask`` is the
+    swatch's own area redrawn on the current reference. Exact pixels compare
+    position: two eyedropper clicks within :data:`PIXEL_SAME_PX` are one place,
+    whatever sensor noise does to their colours. ``swatch`` only needs
+    ``pick``, ``hex``, ``x``, ``y`` and ``bias``.
     """
     from .color import delta_e_rgb
 
-    if (swatch.pick == "spot") != spot:
+    if _kind_of(swatch) != kind:
         return False
-    if not spot and int(getattr(swatch, "bias", 0)) != int(bias):
+    if kind == KIND_PIXEL:
+        h, w = pick.image_shape if pick.image_shape != (0, 0) else pick.mask.shape
+        return math.hypot((pick.x - swatch.x) * w, (pick.y - swatch.y) * h) <= PIXEL_SAME_PX
+    if kind == KIND_REGION and int(getattr(swatch, "bias", 0)) != int(bias):
         return False        # a deliberate Size change is a different pick
     if delta_e_rgb(hex_to_rgb(pick.hex), hex_to_rgb(swatch.hex)) >= SAME_DE:
         return False
-    return _overlap(pick.mask, saved_mask) >= SAME_OVERLAP
+    return saved_mask is not None and _overlap(pick.mask, saved_mask) >= SAME_OVERLAP
 
 
-def find_same(an: Analysis, pick: Pick, spot: bool, bias: int, swatches):
+def saved_mask(an: Analysis, swatch) -> np.ndarray:
+    """A saved swatch's area redrawn on the reference (a single pixel for an eyedropper pick)."""
+    kind = _kind_of(swatch)
+    if kind == KIND_SPOT:
+        return pick_spot(an, swatch.x, swatch.y).mask
+    if kind == KIND_PIXEL:
+        mask = np.zeros(an.shape, dtype=bool)
+        sy, sx = _to_px(an, swatch.x, swatch.y)
+        mask[sy, sx] = True
+        return mask
+    return pick_region(an, swatch.x, swatch.y, tolerance=swatch.tolerance).mask
+
+
+def find_same(an: Analysis, pick: Pick, kind: str, bias: int, swatches):
     """The saved swatch this pick duplicates, if any.
 
-    Filters on colour first, so only a handful of saved regions are ever
-    redrawn — a painting with a hundred swatches still answers instantly.
+    Filters cheaply first (kind, then colour for averaged picks), so only a
+    handful of saved regions are ever redrawn — a painting with a hundred
+    swatches still answers instantly.
     """
     from .color import delta_e_rgb
 
     for sw in swatches:
-        if (sw.pick == "spot") != spot:
+        if _kind_of(sw) != kind:
+            continue
+        if kind == KIND_PIXEL:
+            if same_area(pick, kind, sw, None, bias):
+                return sw
             continue
         if delta_e_rgb(hex_to_rgb(pick.hex), hex_to_rgb(sw.hex)) >= SAME_DE:
             continue
-        saved = (pick_spot(an, sw.x, sw.y) if sw.pick == "spot"
-                 else pick_region(an, sw.x, sw.y, tolerance=sw.tolerance))
-        if same_area(pick, spot, sw, saved.mask, bias):
+        if same_area(pick, kind, sw, saved_mask(an, sw), bias):
             return sw
     return None
 

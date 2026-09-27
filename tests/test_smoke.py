@@ -1337,25 +1337,46 @@ def group29_easel_picking():
     saved = NS(pick="region", hex=pk.hex, x=pk.x, y=pk.y, area_frac=pk.area_frac,
                tolerance=pk.tolerance, bias=0)
     again2 = easel.pick_region(an, 0.52, 0.36)                # another click, same band
-    check(easel.find_same(an, again2, False, 0, [saved]) is saved,
+    check(easel.find_same(an, again2, "region", 0, [saved]) is saved,
           "a second click in the same band is the same area")
     other_band = easel.pick_region(an, 0.5, 0.875)
-    check(easel.find_same(an, other_band, False, 0, [saved]) is None,
+    check(easel.find_same(an, other_band, "region", 0, [saved]) is None,
           "a different band is a different area")
-    check(easel.find_same(an, sp, True, 0, [saved]) is None, "a spot never duplicates a region")
-    check(easel.find_same(an, easel.pick_region(an, 0.52, 0.36, bias=2), False, 2, [saved]) is None,
+    check(easel.find_same(an, sp, "spot", 0, [saved]) is None, "a spot never duplicates a region")
+    check(easel.find_same(an, easel.pick_region(an, 0.52, 0.36, bias=2), "region", 2, [saved]) is None,
           "a deliberate Size change makes its own swatch")
     saved_spot = NS(pick="spot", hex=sp.hex, x=sp.x, y=sp.y, area_frac=sp.area_frac,
                     tolerance=0.0, bias=0)
-    check(easel.find_same(an, easel.pick_spot(an, 0.501, 0.376), True, 0, [saved_spot]) is saved_spot,
+    check(easel.find_same(an, easel.pick_spot(an, 0.501, 0.376), "spot", 0, [saved_spot]) is saved_spot,
           "a spot a pixel away is the same spot")
-    check(easel.find_same(an, easel.pick_spot(an, 0.2, 0.376), True, 0, [saved_spot]) is None,
+    check(easel.find_same(an, easel.pick_spot(an, 0.2, 0.376), "spot", 0, [saved_spot]) is None,
           "a spot across the band is a different spot")
     # Overlap, not size: a re-click that regrows over a smaller part of the same
     # patch is still that patch.
     half = easel.Pick(hex=pk.hex, mask=pk.mask & (np.arange(pk.mask.shape[1])[None, :] < pk.mask.shape[1] // 3),
                       area_frac=0.0, x=pk.x, y=pk.y, bbox=pk.bbox)
-    check(easel.same_area(half, False, saved, pk.mask), "a smaller region inside the same patch matches")
+    check(easel.same_area(half, "region", saved, pk.mask), "a smaller region inside the same patch matches")
+    # The eyedropper: one exact pixel, not an average — and read at full resolution.
+    odd = np.full((300, 400, 3), 120, np.uint8)
+    odd[150, 200] = (200, 30, 40)
+    oan = easel.prepare(odd)
+    ex = easel.pick_pixel(oan, odd, 200.5 / 400, 150.5 / 300)
+    check(ex.hex == "#c81e28", f"the eyedropper returns the exact pixel ({ex.hex})")
+    check(ex.kind == "pixel" and ex.image_shape == (300, 400), "it is an exact-pixel pick")
+    avg = easel.pick_region(oan, 200.5 / 400, 150.5 / 300)
+    check(avg.hex != ex.hex, f"where the area average differs ({avg.hex})")
+    check(ex.mask.sum() == 1 and ex.mask.shape == oan.shape, "its mask marks one analysis pixel")
+    saved_px = NS(pick="pixel", hex=ex.hex, x=ex.x, y=ex.y, bias=0)
+    check(easel.find_same(oan, easel.pick_pixel(oan, odd, 201.5 / 400, 150.5 / 300), "pixel", 0,
+                          [saved_px]) is saved_px, "an exact pick a pixel away is the same point")
+    check(easel.find_same(oan, easel.pick_pixel(oan, odd, 206.5 / 400, 150.5 / 300), "pixel", 0,
+                          [saved_px]) is None, "an exact pick a few pixels away is a new point")
+    check(easel.find_same(oan, avg, "region", 0, [saved_px]) is None,
+          "an area never duplicates an exact pick")
+    patch = easel.loupe_patch(odd, 200.5 / 400, 150.5 / 300)
+    check(patch.shape == (15, 15, 3) and tuple(patch[7, 7]) == (200, 30, 40),
+          "the loupe is centred on the pixel a click takes")
+    check(easel.loupe_patch(odd, 0.0, 0.0).shape == (15, 15, 3), "the loupe works at the edge")
     names = ["Swatch 7", "Swatch 6", "Swatch 5", "Swatch 4", "Swatch 3", "Swatch 1"]
     check(easel.next_swatch_name(names) == "Swatch 8",
           "a new swatch never reuses a name after a delete")
@@ -1569,6 +1590,7 @@ def group34_easel_window():
     app.setOrganizationName("StudioSmokeTest")
     app.setApplicationName("StudioSmokeTest")
     QSettings().clear()
+    from studio import easel
     from studio.library import Library
     from studio.ui.easel_window import EaselWindow
 
@@ -1635,10 +1657,46 @@ def group34_easel_window():
         win._back_to_photo()
         win.canvas.deselected.emit()
         check(not win.canvas.has_region, "clicking the margin around the photo clears it")
-        # Option-click samples a spot.
-        win._on_picked(0.5, 0.375, True)
-        spot = win.project.swatches[0]
-        check(spot.pick == "spot" and spot.area_frac < 0.01, "Option-click samples a small spot")
+        # Option-click from Area takes the exact pixel.
+        win._on_picked(0.3, 0.375, True)
+        exact = win.project.swatches[0]
+        iy, ix = easel.pixel_at(win.display_rgb, 0.3, 0.375)
+        check(exact.pick == "pixel" and exact.hex == color.rgb_to_hex(tuple(int(c) for c in win.display_rgb[iy, ix])),
+              "Option-click takes the exact pixel, not an average")
+        check("no area" in win.canvas._card.amount_text, "an exact point says it can't size an amount")
+        win._back_to_photo()
+        check(win.canvas._marker is not None and win.canvas._overlay is None,
+              "an exact pick is ringed on the photo, nothing dimmed")
+        n_before = len(win.project.swatches)
+        win._on_picked(0.3005, 0.375, True)
+        check(len(win.project.swatches) == n_before, "the same exact point isn't saved twice")
+        win._back_to_photo()
+        # The picker: E toggles, Size only applies to areas, the loupe follows the eyedropper.
+        win._toggle_eyedropper()
+        check(win.pick_mode.currentData() == "pixel", "E switches to the eyedropper")
+        check(not win.region_bias.isEnabled(), "Size is disabled for the eyedropper")
+        check(win.canvas._loupe_mode, "the loupe is on in eyedropper mode")
+        win._on_picked(0.7, 0.375, False)
+        check(win.project.swatches[0].pick == "pixel", "a plain click in eyedropper mode is exact")
+        win._back_to_photo()
+        check(win._kind_for_click(True) == "region", "Option-click from the eyedropper takes the area")
+        win._on_picked(0.52, 0.375, True)
+        check(win.current is not None and win.project.swatch(win.current).pick == "region",
+              "…which is the band already saved, so it shows that swatch")
+        win._back_to_photo()
+        from PySide6.QtCore import QPointF as _P
+        win.canvas._hover = _P(win.canvas._rect.center())
+        win.canvas.grab()                     # paints the loupe without error
+        check(win.canvas._hover is not None, "the loupe paints over the photo")
+        win.canvas._hover = None
+        win._toggle_eyedropper()
+        check(win.pick_mode.currentData() == "region" and win.region_bias.isEnabled()
+              and not win.canvas._loupe_mode, "E switches back to Area")
+        # A small spot is still there as a third pick.
+        win.pick_mode.setCurrentIndex(win.pick_mode.findData("spot"))
+        win._on_picked(0.2, 0.875, False)
+        check(win.project.swatches[0].pick == "spot", "the small spot is still available")
+        win.pick_mode.setCurrentIndex(win.pick_mode.findData("region"))
         win._back_to_photo()
 
         # Value mode.
@@ -1647,7 +1705,8 @@ def group34_easel_window():
         win.act_value.setChecked(False)
 
         # Naming, tags, notes persist.
-        item = win.history.item(1)
+        item = next(win.history.item(i) for i in range(win.history.count())
+                    if win.project.swatch(win.history.item(i).data(0x0100)[1]).pick == "region")
         win._on_history_clicked(item)
         win.name_edit.setText("sky band")
         win.tags_edit.setText("background, cool")

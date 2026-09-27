@@ -112,12 +112,20 @@ or go straight there:
 python main.py --easel
 ```
 
-- **Click the reference, get the colour big.** A click selects the patch of
-  similar colour you meant — outlined on the photo — and fills the window with
-  its average on a neutral mid-grey surround, the one background that doesn't
-  push a colour warmer, cooler, lighter or darker. Click again to go back.
-  **Option-click** samples a small spot instead; **Size** makes the region
-  smaller or larger than the automatic choice.
+- **Click the reference, get the colour big.** The colour fills the window on
+  a neutral mid-grey surround, the one background that doesn't push a colour
+  warmer, cooler, lighter or darker. Click again to go back. Three ways to pick:
+  - **Area — average**: selects the patch of similar colour you clicked
+    (outlined on the photo) and averages it — the colour you'd mix for that
+    shape. **Size** makes it smaller or larger than the automatic choice.
+  - **Eyedropper — exact pixel**: the colour of the one pixel under the cursor,
+    no averaging, read from the full-resolution photo. A **loupe** magnifies
+    the pixels round the cursor so the pick lands where you mean, and the point
+    is ringed on the photo afterwards.
+  - **Small spot — average**: a small circle, for details an area would swallow.
+
+  **Option-click** uses the eyedropper while picking areas (and the area while
+  using the eyedropper); **E** switches between the two.
 - **What to mix, from your paints.** The recipe as parts, the closest colour
   your palette actually reaches (shown under the target, with how close it is
   in words), and numbered steps **in the order that works**: white first for
@@ -148,8 +156,8 @@ macOS's built-in `sips`.
 
 Keys: **Space** back to the photo · **Esc** back, then clear the selection ·
 **⌘D** clear the selection (so is clicking the margin around the photo) ·
-**V** value · **⌫** delete swatch · **⌘N** new painting · **⌘F** search ·
-**⌃⌘F** full screen.
+**V** value · **E** Area ↔ Eyedropper · **⌫** delete swatch · **⌘N** new painting ·
+**⌘F** search · **⌃⌘F** full screen.
 
 ## Run
 

@@ -10,9 +10,10 @@ Deliberately separate from the document window: this is a live tool, not a
 sheet for printing, and it wants the whole screen and very few controls.
 
 Keys: Space back to the photo · Esc back, then clear the selection · ⌘D clear
-the selection · V value (colour off) · ⌫ delete swatch · ⌘N new painting ·
-⌘F search · ⌃⌘F full screen · Option-click samples a small spot instead of a
-region. Clicking the margin around the photo also clears the selection.
+the selection · V value (colour off) · E switch between Area and Eyedropper ·
+⌫ delete swatch · ⌘N new painting · ⌘F search · ⌃⌘F full screen.
+Option-click takes the exact pixel when picking areas (and the area average when
+using the eyedropper). Clicking the margin around the photo clears the selection.
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
-from PySide6.QtCore import QRectF, QSettings, QStandardPaths, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSettings, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -66,9 +67,11 @@ from .palette_panel import PalettePanel
 from .render import ndarray_to_qimage
 
 DISPLAY_EDGE = 1600
+LOUPE_HALF = 7          # the loupe shows a 15 × 15 pixel neighbourhood…
+LOUPE_CELL = 9          # …each pixel drawn 9 screen pixels wide
 CARD_BG = "#f4f2ec"
 CARD_INK = "#1b1b1b"
-HINT = "Click anywhere to go back to the photo   ·   V value   ·   ⌫ delete   ·   Esc Esc clears the selection"
+HINT = "Click anywhere to go back to the photo   ·   V value   ·   E eyedropper   ·   ⌫ delete   ·   Esc Esc clears the selection"
 
 
 def library_root() -> str:
@@ -101,7 +104,7 @@ class SwatchCard:
 class EaselCanvas(QWidget):
     """The reference photo, or one colour filling the view."""
 
-    picked = Signal(float, float, bool)   # normalized x, y, spot (Option held)
+    picked = Signal(float, float, bool)   # normalized x, y, Option held
     dismissed = Signal()                  # clicked while a swatch is showing
     empty_clicked = Signal()
     deselected = Signal()                 # clicked the margin around the photo
@@ -117,8 +120,12 @@ class EaselCanvas(QWidget):
         self._value = False
         self._rect = QRectF()
         self._placeholder = ""
+        self._marker = None                # (x, y) of an exact-pixel pick
+        self._loupe_mode = False           # the eyedropper is the active pick
+        self._hover = None                 # cursor position the loupe follows
         self.setMinimumSize(420, 360)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
 
     # -- state --------------------------------------------------------------------
     @property
@@ -140,8 +147,22 @@ class EaselCanvas(QWidget):
         self._mode = "photo"
         self.update()
 
+    def set_marker(self, x: float, y: float) -> None:
+        """Mark one exact point on the photo — no dimming, just a ring round the pixel."""
+        self._overlay = None
+        self._marker = (float(x), float(y))
+        self.update()
+
+    def set_loupe_mode(self, on: bool) -> None:
+        """Magnify the pixels under the cursor, so an exact pick lands where you mean."""
+        self._loupe_mode = bool(on)
+        if not on:
+            self._hover = None
+        self.update()
+
     def set_region(self, mask: Optional[np.ndarray]) -> None:
         """Outline a region on the photo: everything else dimmed, the edge in white."""
+        self._marker = None
         if mask is None:
             self._overlay = None
         else:
@@ -155,7 +176,7 @@ class EaselCanvas(QWidget):
 
     @property
     def has_region(self) -> bool:
-        return self._overlay is not None
+        return self._overlay is not None or self._marker is not None
 
     def show_photo(self) -> None:
         if self._photo is not None:
@@ -189,8 +210,23 @@ class EaselCanvas(QWidget):
             return
         nx = (pos.x() - self._rect.x()) / self._rect.width()
         ny = (pos.y() - self._rect.y()) / self._rect.height()
-        spot = bool(event.modifiers() & Qt.AltModifier)
-        self.picked.emit(nx, ny, spot)
+        self.picked.emit(nx, ny, bool(event.modifiers() & Qt.AltModifier))
+
+    def mouseMoveEvent(self, event):
+        # The loupe shows whenever the next click would be an exact pick: in
+        # Eyedropper mode, or with Option held in the other modes.
+        alt = bool(event.modifiers() & Qt.AltModifier)
+        want = (self._loupe_mode != alt and self._mode == "photo" and self._rgb is not None
+                and self._rect.contains(event.position()))
+        hover = event.position() if want else None
+        if hover is not None or self._hover is not None:
+            self._hover = hover
+            self.update()
+
+    def leaveEvent(self, _event):
+        if self._hover is not None:
+            self._hover = None
+            self.update()
 
     # -- painting --------------------------------------------------------------------
     def paintEvent(self, _event):
@@ -220,6 +256,66 @@ class EaselCanvas(QWidget):
         p.drawImage(self._rect, img)
         if self._overlay is not None:
             p.drawImage(self._rect, self._overlay)
+        if self._marker is not None:
+            self._paint_marker(p)
+        if self._hover is not None:
+            self._paint_loupe(p)
+
+    def _to_widget(self, x: float, y: float) -> QPointF:
+        return QPointF(self._rect.x() + x * self._rect.width(), self._rect.y() + y * self._rect.height())
+
+    def _paint_marker(self, p: QPainter) -> None:
+        """A ring with ticks round the exact point — visible on light and dark alike."""
+        c = self._to_widget(*self._marker)
+        for colour, width in (("#000000", 4.0), ("#ffffff", 1.6)):
+            p.setPen(QPen(QColor(colour), width))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(c, 9.0, 9.0)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                p.drawLine(QPointF(c.x() + dx * 12, c.y() + dy * 12),
+                           QPointF(c.x() + dx * 18, c.y() + dy * 18))
+
+    def _paint_loupe(self, p: QPainter) -> None:
+        """Magnified pixels round the cursor; the outlined centre one is what a click takes."""
+        pos = self._hover
+        nx = (pos.x() - self._rect.x()) / self._rect.width()
+        ny = (pos.y() - self._rect.y()) / self._rect.height()
+        patch = easel.loupe_patch(self._rgb, nx, ny, LOUPE_HALF)
+        centre = patch[LOUPE_HALF, LOUPE_HALF]
+        if self._value:
+            patch = easel.greyscale(patch)
+        n = patch.shape[0]
+        size = n * LOUPE_CELL
+        x0, y0 = pos.x() + 24, pos.y() + 24
+        if x0 + size > self.width() - 4:
+            x0 = pos.x() - 24 - size
+        if y0 + size + 30 > self.height() - 4:
+            y0 = pos.y() - 24 - size - 30
+        box = QRectF(x0, y0, size, size)
+        p.save()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False)   # hard pixel edges
+        p.drawImage(box, ndarray_to_qimage(patch))
+        p.restore()
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#f4f2ec"), 2))
+        p.drawRect(box)
+        cell = QRectF(x0 + LOUPE_HALF * LOUPE_CELL, y0 + LOUPE_HALF * LOUPE_CELL, LOUPE_CELL, LOUPE_CELL)
+        p.setPen(QPen(QColor("#000000"), 3))
+        p.drawRect(cell)
+        p.setPen(QPen(QColor("#ffffff"), 1.2))
+        p.drawRect(cell)
+        hex_ = "#%02x%02x%02x" % tuple(int(v) for v in centre)
+        label = QRectF(x0, y0 + size + 4, size, 24)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(20, 20, 20, 225))
+        p.drawRoundedRect(label, 4, 4)
+        p.setBrush(QColor(hex_))
+        p.drawRect(QRectF(label.x() + 5, label.y() + 5, 14, 14))
+        f = QFont()
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(QColor("#f4f2ec"))
+        p.drawText(label.adjusted(26, 0, 0, 0), int(Qt.AlignLeft | Qt.AlignVCenter), f"exact  {hex_}")
 
     def _paint_swatch(self, p: QPainter) -> None:
         c = self._card
@@ -514,10 +610,16 @@ class EaselWindow(QMainWindow):
         tb.addSeparator()
         tb.addWidget(QLabel(" Pick "))
         self.pick_mode = QComboBox()
-        self.pick_mode.addItem("Region", "region")
-        self.pick_mode.addItem("Spot", "spot")
-        self.pick_mode.setToolTip("Region: the patch of similar colour you click. "
-                                  "Spot: a small circle. Option-click does the other one.")
+        self.pick_mode.addItem("Area — average", easel.KIND_REGION)
+        self.pick_mode.addItem("Eyedropper — exact pixel", easel.KIND_PIXEL)
+        self.pick_mode.addItem("Small spot — average", easel.KIND_SPOT)
+        self.pick_mode.setToolTip(
+            "Area: the average of the patch of similar colour you click.\n"
+            "Eyedropper: the exact colour of the pixel under the cursor, no averaging.\n"
+            "Small spot: the average of a small circle.\n"
+            "Option-click uses the eyedropper from Area (and Area from the eyedropper). "
+            "E switches between them.")
+        self.pick_mode.currentIndexChanged.connect(self._on_pick_mode)
         tb.addWidget(self.pick_mode)
         tb.addWidget(QLabel(" Size "))
         self.region_bias = QSlider(Qt.Horizontal)
@@ -546,6 +648,10 @@ class EaselWindow(QMainWindow):
         tb.addAction(self.act_full)
 
         # Keys that don't need a button.
+        eyedrop = QAction(self)
+        eyedrop.setShortcut(QKeySequence("E"))
+        eyedrop.triggered.connect(self._toggle_eyedropper)
+        self.addAction(eyedrop)
         for keys, slot in (
             (("Space",), self._back_to_photo),
             (("Esc",), self._escape),
@@ -559,6 +665,7 @@ class EaselWindow(QMainWindow):
         find.setShortcut(QKeySequence.Find)
         find.triggered.connect(lambda: (self.search.setFocus(), self.search.selectAll()))
         self.addAction(find)
+        self._on_pick_mode()
         self.statusBar().showMessage("Click the reference to see a colour big, with how to mix it.")
 
     # -- palettes -------------------------------------------------------------------------
@@ -744,36 +851,64 @@ class EaselWindow(QMainWindow):
                                 easel.paints_per_mix(medium))
         return recipes[0] if recipes else None
 
+    def _on_pick_mode(self, _i=None):
+        kind = self.pick_mode.currentData()
+        self.region_bias.setEnabled(kind == easel.KIND_REGION)   # Size only shapes an area
+        self.canvas.set_loupe_mode(kind == easel.KIND_PIXEL)
+
+    def _toggle_eyedropper(self):
+        """E: flip between averaging an area and the exact-pixel eyedropper."""
+        want = (easel.KIND_REGION if self.pick_mode.currentData() == easel.KIND_PIXEL
+                else easel.KIND_PIXEL)
+        self.pick_mode.setCurrentIndex(self.pick_mode.findData(want))
+
+    def _kind_for_click(self, alt: bool) -> str:
+        """The pick a click makes. Option swaps between the two main ones."""
+        mode = self.pick_mode.currentData()
+        if not alt:
+            return mode
+        return easel.KIND_REGION if mode == easel.KIND_PIXEL else easel.KIND_PIXEL
+
+    def _mark(self, kind: str, x: float, y: float, mask) -> None:
+        """Show a pick on the photo: a ring for an exact pixel, an outline for an area."""
+        if kind == easel.KIND_PIXEL:
+            self.canvas.set_marker(x, y)
+        else:
+            self.canvas.set_region(mask)
+
     def _on_picked(self, nx: float, ny: float, alt: bool):
         if self.project is None or self.analysis is None:
             return
         self._save_details(refresh=False)
-        spot = (self.pick_mode.currentData() == "spot") != alt
-        if spot:
+        kind = self._kind_for_click(alt)
+        if kind == easel.KIND_PIXEL:
+            pk = easel.pick_pixel(self.analysis, self.display_rgb, nx, ny)
+        elif kind == easel.KIND_SPOT:
             pk = easel.pick_spot(self.analysis, nx, ny)
         else:
             pk = easel.pick_region(self.analysis, nx, ny, bias=self.region_bias.value())
-        # An area already in the history opens that swatch instead of adding a
-        # copy of it — clicking the cheek twice shouldn't give two cheek swatches.
-        bias = 0 if spot else self.region_bias.value()
-        existing = easel.find_same(self.analysis, pk, spot, bias, self.project.swatches)
+        bias = self.region_bias.value() if kind == easel.KIND_REGION else 0
+        # Somewhere already in the history opens that swatch instead of adding a
+        # copy — clicking the cheek twice shouldn't give two cheek swatches.
+        existing = easel.find_same(self.analysis, pk, kind, bias, self.project.swatches)
         if existing is not None:
-            self.canvas.set_region(pk.mask)
+            self._mark(kind, existing.x, existing.y, pk.mask)
             self._refresh_history(select=existing.id)
             self._show(existing)
+            where = "exact point" if kind == easel.KIND_PIXEL else "area"
             self.statusBar().showMessage(
-                f"That area is already “{existing.label()}” — showing it. Change Size "
-                "or Option-click if you want a different pick there.")
+                f"That {where} is already “{existing.label()}” — showing it. Change Size "
+                "or the pick type if you want a different pick there.")
             return
         sw = Swatch(
             id=new_swatch_id(), hex=pk.hex, x=pk.x, y=pk.y, area_frac=pk.area_frac,
             recipe=self._solve(pk.hex), palette=self.palette.name, medium=self.palette.medium,
-            pick="spot" if spot else "region", tolerance=pk.tolerance, bias=bias,
+            pick=kind, tolerance=pk.tolerance, bias=bias,
             name=easel.next_swatch_name(s.name for s in self.project.swatches),
         )
         crop = easel.crop_around(self.display_rgb, pk.x, pk.y, pk.bbox)
         self.lib.add_swatch(self.project, sw, crop)
-        self.canvas.set_region(pk.mask)
+        self._mark(kind, pk.x, pk.y, pk.mask)
         self._refresh_history(select=sw.id)
         self._show(sw)
 
@@ -783,7 +918,11 @@ class EaselWindow(QMainWindow):
         self.current = sw.id
         proj = self.project
         area = easel.canvas_cm2(proj.canvas_w, proj.canvas_h, proj.units)
-        total, amount = easel.amount_summary(sw.medium, sw.area_frac, area)
+        if sw.pick == easel.KIND_PIXEL:
+            total, amount = 0.0, ("An exact point has no area to size an amount from — mix a "
+                                  "little to test it, or pick the Area to see how much you need.")
+        else:
+            total, amount = easel.amount_summary(sw.medium, sw.area_frac, area)
         # Read names and traits from the palette this swatch was mixed with, if
         # it still exists — whiteness and staining decide the mixing order.
         pal = self.lib.palette(sw.palette) or self.palette
@@ -791,6 +930,7 @@ class EaselWindow(QMainWindow):
         recipe = sw.recipe
         L, v = easel.value_of(sw.hex)
         crop_path = self.lib.crop_path(proj, sw)
+        how = {easel.KIND_PIXEL: "  ·  exact pixel", easel.KIND_SPOT: "  ·  small spot"}.get(sw.pick, "")
         card = SwatchCard(
             title=sw.label(),
             target_hex=sw.hex,
@@ -798,7 +938,7 @@ class EaselWindow(QMainWindow):
             delta_e=recipe.delta_e if recipe else 0.0,
             achievable=recipe.achievable if recipe else False,
             description=easel.describe(sw.hex).capitalize(),
-            value_text=f"Value {v} of 10  (L* {L:.0f})  ·  {sw.hex}",
+            value_text=f"Value {v} of 10  (L* {L:.0f})  ·  {sw.hex}{how}",
             ratio_text=parts_text(recipe, names) if recipe else "No paints in this palette.",
             amount_text=amount,
             steps=easel.mixing_steps(recipe, pal.paints, sw.medium, total) if recipe else [],
@@ -834,9 +974,9 @@ class EaselWindow(QMainWindow):
             return
         sw = self.project.swatch(self.current) if (self.project and self.current) else None
         if sw is not None and self.analysis is not None:
-            pk = (easel.pick_spot(self.analysis, sw.x, sw.y) if sw.pick == "spot"
-                  else easel.pick_region(self.analysis, sw.x, sw.y, tolerance=sw.tolerance))
-            self.canvas.set_region(pk.mask)
+            kind = sw.pick or easel.KIND_REGION
+            mask = None if kind == easel.KIND_PIXEL else easel.saved_mask(self.analysis, sw)
+            self._mark(kind, sw.x, sw.y, mask)
         self.canvas.show_photo()
 
     # -- history --------------------------------------------------------------------------------
@@ -851,8 +991,9 @@ class EaselWindow(QMainWindow):
             n = len(proj.swatches) - proj.swatches.index(sw)
             recipe = (" + ".join(s.paint_name for s in sw.recipe.steps) if sw.recipe else "")
             head = f"{proj.name} — " if scope_all else ""
+            how = {easel.KIND_PIXEL: " · exact", easel.KIND_SPOT: " · spot"}.get(sw.pick, "")
             item = QListWidgetItem(self._icon(proj, sw),
-                                   f"{head}{sw.label(n)}\n{recipe}\n{sw.created[:10]}")
+                                   f"{head}{sw.label(n)}{how}\n{recipe}\n{sw.created[:10]}")
             item.setData(Qt.UserRole, (proj.id, sw.id))
             item.setToolTip(sw.notes or sw.hex)
             self.history.addItem(item)
