@@ -1785,6 +1785,197 @@ def group34_easel_window():
     QSettings().clear()
 
 
+def group35_projects():
+    print("\n[35] Projects — save, open, recent")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("StudioSmokeTest")
+    app.setApplicationName("StudioSmokeTest")
+    QSettings().clear()
+    from studio.library import Library, Swatch, new_swatch_id
+    from studio.session import params_from_dict
+    from studio.ui import projects
+    from studio.ui.easel_window import EaselWindow
+    from studio.ui.main_window import MainWindow
+    from PIL import Image
+
+    def swatch(hex_="#886644"):
+        return Swatch(id=new_swatch_id(), hex=hex_, x=0.5, y=0.5, area_frac=0.1,
+                      recipe=None, palette="p", medium="oil")
+
+    # The two windows own different halves of project.json.
+    with tempfile.TemporaryDirectory() as td:
+        lib = Library(td)
+        proj = lib.create_project("Pears", "p")
+        easel_copy = lib.load_project(proj.id)          # the Easel, open since before the save
+        lib.save_document(proj.id, {"params": {"doc_mode": "plan"}, "page": 0, "dpi": 200})
+        lib.add_swatch(easel_copy, swatch())            # ...then saves a swatch
+        back = lib.load_project(proj.id)
+        check(back.document is not None and back.document["params"] == {"doc_mode": "plan"},
+              "an Easel save never undoes the document window's save")
+        check(len(back.swatches) == 1, "and its swatch is there too")
+        lib.save_document(proj.id, {"params": {"doc_mode": "mosaic"}, "page": 0, "dpi": 200})
+        back = lib.load_project(proj.id)
+        check(len(back.swatches) == 1 and back.document["params"]["doc_mode"] == "mosaic",
+              "a document save keeps swatches the Easel made after it opened")
+        dup = lib.duplicate_project(proj.id, "Pears II")
+        check(dup.id != proj.id and dup.name == "Pears II" and len(dup.swatches) == 1
+              and dup.document == back.document, "Save As copies swatches and document")
+        lib.add_swatch(dup, swatch("#112233"))
+        check(len(lib.load_project(proj.id).swatches) == 1, "and the copy is independent")
+
+    def wait(cond, secs=10.0):
+        deadline = time.monotonic() + secs
+        while not cond() and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        return cond()
+
+    envlib = Library(os.environ["PAINTING_STUDIO_LIBRARY"])
+    photo_dir = tempfile.mkdtemp(prefix="studio-smoke-photos-")
+    photo = os.path.join(photo_dir, "still-life.png")
+    Image.fromarray(make_still_life().astype(np.uint8)).save(photo)
+    photo2 = os.path.join(photo_dir, "bands.png")
+    Image.fromarray(make_plan_scene()).save(photo2)
+
+    asked = []
+    answers = []
+    orig_ask, orig_text = projects.ask_save_changes, QInputDialog.getText
+    projects.ask_save_changes = lambda _w, name: (asked.append(name), answers.pop(0))[1]
+    names = []
+    QInputDialog.getText = staticmethod(lambda *a, **k: (names.pop(0), True))
+    try:
+        mw = MainWindow()
+        check(mw.project is None and "Untitled" in mw.windowTitle(), "a first launch is untitled")
+        check(not mw._needs_saving(), "and there is nothing to save yet")
+        mw._load_path(photo)
+        check(wait(lambda: mw._result is not None and mw._result.working_rgb is not None),
+              "the photo loads")
+        check(mw._needs_saving(), "untitled work with a photo counts as unsaved")
+
+        names.append("Still life")
+        check(mw._save() and mw.project is not None, "Save on untitled work asks for a name (Save As)")
+        pid = mw.project.id
+        check(mw._path and mw._path.startswith(mw.project.path + os.sep),
+              "the photo is copied into the project")
+        check(not mw._is_dirty() and not mw.isWindowModified(), "and it is clean after saving")
+        check("Still life" in mw.windowTitle(), "the title names the project")
+        check(projects.recent_ids()[0] == pid, "it heads the recent list")
+
+        mw.params = mw.params.copy(selected_target=2, eyedropper_mode=True)
+        check(not mw._is_dirty(), "highlighting and the eyedropper are not edits")
+        mw.params = mw.params.copy(extract_n=mw.params.extract_n + 1, eyedropper_mode=False,
+                                   selected_target=-1)
+        mw._update_title()
+        check(mw._is_dirty() and mw.isWindowModified(), "a real edit marks it unsaved")
+        check(mw._save() and not mw._is_dirty(), "Save writes it")
+        saved = params_from_dict(envlib.load_project(pid).document["params"])
+        check(saved.extract_n == mw.params.extract_n, "the saved document has the edit")
+
+        # A new project, then back again.
+        mw._new_project()
+        check(asked == [], "New on a clean project doesn't ask")
+        check(mw.project is None and mw._path is None
+              and mw.upload.drop.text() == "Drop a reference photo here",
+              "New clears the photo")
+        check(wait(lambda: mw._result is not None and mw._result.working_rgb is None),
+              "and the board renders without it")
+        mw._open_project(pid)
+        check(mw.project.id == pid and mw.params.extract_n == saved.extract_n,
+              "Open restores the project's settings")
+        check(mw._path == envlib.reference_path(mw.project), "and its photo")
+        check(not mw._is_dirty(), "and opens clean")
+
+        # A second project; the Easel adds a swatch to the first meanwhile.
+        mw._new_project()
+        mw._load_path(photo2)
+        names.append("Bands")
+        mw._save_as()
+        pid2 = mw.project.id
+        first = envlib.load_project(pid)
+        envlib.add_swatch(first, swatch())
+        check([p.id for p in projects.recent_projects(envlib)][:2] == [pid2, pid],
+              "recent projects, newest first")
+        mw._rebuild_recent_menu()
+        texts = [a.text() for a in mw.recent_menu.actions()]
+        check(texts[:2] == ["Bands", "Still life"] and "Clear Menu" in texts,
+              "the Open Recent menu lists them")
+
+        # Unsaved changes: Cancel stays, Discard switches.
+        mw.params = mw.params.copy(extract_n=mw.params.extract_n + 1)
+        answers.append(projects.CANCEL)
+        mw._open_project(pid)
+        check(asked == ["Bands"] and mw.project.id == pid2, "Cancel keeps the unsaved project open")
+        answers.append(projects.DISCARD)
+        mw._open_project(pid)
+        check(mw.project.id == pid, "Discard opens the other one")
+        check(len(envlib.load_project(pid).swatches) == 1, "the Easel's swatch was never touched")
+        n_before = len(os.listdir(envlib.projects_dir))
+        names.append("Still life (warm)")
+        mw._save_as()
+        copy = envlib.load_project(mw.project.id)
+        check(len(os.listdir(envlib.projects_dir)) == n_before + 1 and len(copy.swatches) == 1,
+              "Save As on a project makes a full copy, swatches included")
+
+        # The Easel opens on the same painting, and hears about new ones.
+        mw._open_project(pid)
+        mw._open_easel()
+        ew = mw._easel
+        check(ew.project is not None and ew.project.id == pid, "the Easel opens on this project")
+        mw._new_project()
+        mw._load_path(photo)
+        names.append("Fresh")
+        mw._save_as()
+        check(ew.project_combo.findData(mw.project.id) >= 0, "a project saved here appears in the Easel")
+        check(ew.project.id == pid, "without switching the painting the Easel is on")
+        # The two launchers are separate processes: the Easel catches up by itself.
+        elsewhere = envlib.create_project("Saved elsewhere", "p")
+        stamp = ew._ref_stamp
+        time.sleep(0.02)
+        envlib.set_reference(envlib.load_project(pid), photo2)
+        ew.refresh_projects()
+        check(ew.project_combo.findData(elsewhere.id) >= 0 and ew.project.id == pid,
+              "the Easel lists a project another process made")
+        check(ew._ref_stamp != stamp and ew.display_rgb is not None,
+              "and reloads a photo replaced under it")
+
+        # Quit and relaunch: the last project comes back.
+        last = mw.project.id
+        mw.params = mw.params.copy(extract_n=mw.params.extract_n + 1)
+        answers.append(projects.CANCEL)
+        check(not mw.close() and mw.project.id == last, "quitting with unsaved changes can be cancelled")
+        answers.append(projects.DISCARD)
+        mw.close()
+        ew.close()
+        mw2 = MainWindow()
+        check(mw2.project is not None and mw2.project.id == last, "relaunch reopens the last project")
+        check(not mw2._is_dirty(), "clean")
+
+        # A project deleted since stays out of the list.
+        envlib.delete_project(pid2)
+        check(pid2 not in [p.id for p in projects.recent_projects(envlib)],
+              "a deleted project drops out of Recent")
+        warned = []
+        orig_warn = QMessageBox.warning
+        QMessageBox.warning = staticmethod(lambda *a, **k: warned.append(a))
+        try:
+            mw2._open_project(pid2)
+        finally:
+            QMessageBox.warning = orig_warn
+        check(warned and mw2.project.id == last and pid2 not in projects.recent_ids(),
+              "opening it says so and forgets it")
+        mw2._thread.quit()
+        mw2._thread.wait(3000)
+        mw._thread.wait(3000)
+    finally:
+        projects.ask_save_changes = orig_ask
+        QInputDialog.getText = orig_text
+        QSettings().clear()
+
+
 def main() -> int:
     group1_color_math()
     group2_mixer()
@@ -1820,6 +2011,7 @@ def main() -> int:
     group32_library()
     group33_solver_four_paints()
     group34_easel_window()
+    group35_projects()
 
     print(f"\n{'=' * 60}")
     if _failures:

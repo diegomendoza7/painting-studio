@@ -9,6 +9,8 @@ from typing import Optional
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
+    QMenu,
+    QToolButton,
     QColorDialog,
     QFileDialog,
     QHBoxLayout,
@@ -39,8 +41,10 @@ from ..params import (
 from ..pipeline.core import Result
 from ..pipeline.loader import count_pdf_pages, is_pdf
 from ..pipeline.mosaic_doc import build_grid_sheet
-from ..session import decode_session, encode_session
+from ..library import Library, palette_or_first
+from ..session import decode_session, encode_session, params_from_dict, params_to_dict
 from ..svg import scene_to_svg
+from . import projects
 from .controls import ControlsPanel
 from .palette_panel import PalettePanel
 from .pdf_print import write_scale_pdf as write_scale_pdf_vector, write_tiled_pdf
@@ -62,6 +66,7 @@ def _in_rect(x: float, y: float, rect) -> bool:
 class MainWindow(QMainWindow):
     request_load = Signal(str, int, int)   # path, page, dpi
     request_process = Signal(object)       # RenderRequest
+    request_clear = Signal()               # forget the photo (new, empty project)
 
     def __init__(self):
         super().__init__()
@@ -70,6 +75,13 @@ class MainWindow(QMainWindow):
 
         self.params = Params()
         self._path: Optional[str] = None
+        # The open project (None = an untitled workspace), and the state it was
+        # last saved or opened in — what "has this changed?" compares against.
+        from .easel_window import library_root
+        self.lib = Library(library_root())
+        self.project = None
+        self._saved_key = None
+        self._easel = None
         self._busy = False
         self._pending = False
         self._result: Optional[Result] = None
@@ -119,7 +131,22 @@ class MainWindow(QMainWindow):
         # Toolbar
         tb = self.addToolBar("Main")
         tb.setMovable(False)
-        self.act_open = QAction("Open Photo", self)
+        self.act_open = QAction("Reference Photo…", self)
+        self.act_open.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        self.act_new_project = QAction("New Project", self)
+        self.act_new_project.setShortcut(QKeySequence.New)
+        self.act_open_project = QAction("Open…", self)
+        self.act_open_project.setIconText("Open")
+        self.act_open_project.setShortcut(QKeySequence.Open)
+        self.act_open_project.setToolTip("Open a project (⌘O). The arrow lists recent ones.")
+        self.act_save = QAction("Save", self)
+        self.act_save.setShortcut(QKeySequence.Save)
+        self.act_save.setToolTip("Save this project (⌘S) — photo, palette and every setting.")
+        self.act_save_as = QAction("Save As…", self)
+        self.act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.recent_menu = QMenu("Open Recent", self)
+        # The Easel adds to the list too, so build it fresh each time it opens.
+        self.recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
         self.act_svg = QAction("Export SVG", self)
         self.act_png = QAction("Export PNG", self)
         self.act_pdf = QAction("Export PDF", self)
@@ -134,9 +161,28 @@ class MainWindow(QMainWindow):
         self.act_easel.setToolTip(
             "Open the easel: click your reference to see a colour big, with how to mix "
             "it from your palette. Swatches are saved per painting.")
-        for a in (self.act_open, self.act_svg, self.act_png, self.act_pdf,
-                  self.act_grid, self.act_reset, self.act_easel):
+        for a in (self.act_open_project, self.act_save, self.act_svg, self.act_png,
+                  self.act_pdf, self.act_grid, self.act_reset, self.act_easel):
             tb.addAction(a)
+        # Recent projects hang off the Open button's ▾, as in the drawing app. On
+        # the button, not the action: an action with a menu turns into a
+        # submenu in the File menu and stops opening the dialog.
+        open_btn = tb.widgetForAction(self.act_open_project)
+        if isinstance(open_btn, QToolButton):
+            open_btn.setMenu(self.recent_menu)
+            open_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.file_menu = file_menu = self.menuBar().addMenu("File")
+        file_menu.addAction(self.act_new_project)
+        file_menu.addAction(self.act_open_project)
+        file_menu.addMenu(self.recent_menu)
+        file_menu.addSeparator()
+        file_menu.addAction(self.act_save)
+        file_menu.addAction(self.act_save_as)
+        file_menu.addSeparator()
+        file_menu.addAction(self.act_open)
+        file_menu.addSeparator()
+        for a in (self.act_svg, self.act_png, self.act_pdf, self.act_grid):
+            file_menu.addAction(a)
         self.act_grid.setVisible(False)   # mosaic-only
         self.act_svg.setEnabled(False)
         self.act_png.setEnabled(False)
@@ -190,6 +236,10 @@ class MainWindow(QMainWindow):
 
         # Signals
         self.act_open.triggered.connect(self._choose_file)
+        self.act_new_project.triggered.connect(self._new_project)
+        self.act_open_project.triggered.connect(self._open_project_dialog)
+        self.act_save.triggered.connect(self._save)
+        self.act_save_as.triggered.connect(self._save_as)
         self.act_svg.triggered.connect(self._export_svg)
         self.act_png.triggered.connect(self._export_png)
         self.act_pdf.triggered.connect(self._export_pdf)
@@ -222,6 +272,7 @@ class MainWindow(QMainWindow):
         self._worker = Worker()
         self._worker.moveToThread(self._thread)
         self.request_load.connect(self._worker.load_source)
+        self.request_clear.connect(self._worker.clear_source)
         self.request_process.connect(self._worker.process)
         self._worker.source_loaded.connect(self._on_source_loaded)
         self._worker.finished.connect(self._on_finished)
@@ -233,12 +284,8 @@ class MainWindow(QMainWindow):
     def _own_palette(self):
         """The artist's palette from the library, if they've chosen one."""
         try:
-            from ..library import Library
-            from .easel_window import library_root
-
-            lib = Library(library_root())
-            name = lib.default_palette_name()
-            return lib.palette(name) if name else None
+            name = self.lib.default_palette_name()
+            return self.lib.palette(name) if name else None
         except OSError:
             return None
 
@@ -247,44 +294,33 @@ class MainWindow(QMainWindow):
         return params.copy(palette=pal.paints, medium=pal.medium) if pal else params
 
     def _restore_session(self):
-        """Reload the last session (photo + params + window state) on launch."""
-        state = decode_session(QSettings().value("session/json", "", str))
-        if state is None:
-            # First launch: start from the artist's own palette, not a starter kit.
-            self.params = self._with_own_palette(self.params)
-            self.controls.apply(self.params)
-            self.palette_panel.set_palette(self.params.palette)
-            return
-
-        self.params = state["params"]
-        self.controls.apply(self.params)
-        self.palette_panel.set_palette(self.params.palette)
-
-        geometry = QSettings().value("window/geometry")
+        """On launch: reopen the last project, or else the untitled workspace."""
+        settings = QSettings()
+        geometry = settings.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
-
-        path = state.get("path")
-        if path and os.path.exists(path):
-            self._path = path
-            if is_pdf(path):
-                try:
-                    pages = count_pdf_pages(path)
-                except Exception:  # noqa: BLE001 - a broken PDF shouldn't block launch
-                    pages = 0
-                self.upload.set_pdf_pages(pages)
-                self.upload.set_pdf_state(int(state.get("page", 0)), int(state.get("dpi", 200)))
-            else:
-                self.upload.hide_pdf()
-            self.statusBar().showMessage(f"Restoring {os.path.basename(path)}…")
-            self.request_load.emit(path, self.upload.current_page(), self.upload.current_dpi())
-        elif path:
-            self.statusBar().showMessage(
-                "Previous photo not found — settings restored. Open a photo to continue."
-            )
+        self._rebuild_recent_menu()
+        last = projects.project_or_none(self.lib, settings.value(projects.LAST_KEY, "", str))
+        if last is not None:
+            self._open_project(last.id, ask=False)
+            return
+        state = decode_session(settings.value("session/json", "", str))
+        if state is None:
+            # First launch: start from the artist's own palette, not a starter kit.
+            self._apply_document(self._with_own_palette(self.params), None, render=False)
+        else:
+            path = state.get("path")
+            self._apply_document(state["params"], path, int(state.get("page", 0)),
+                                 int(state.get("dpi", 200)), render=False)
+            if path and not os.path.exists(path):
+                self.statusBar().showMessage(
+                    "Previous photo not found — settings restored. Open a photo to continue.")
+        self._mark_saved()
 
     def _save_session(self):
         settings = QSettings()
+        # The untitled workspace still restores itself exactly as before; a
+        # project reopens from its own saved file.
         settings.setValue(
             "session/json",
             encode_session(
@@ -294,7 +330,199 @@ class MainWindow(QMainWindow):
                 params=self.params,
             ),
         )
+        settings.setValue(projects.LAST_KEY, self.project.id if self.project else "")
         settings.setValue("window/geometry", self.saveGeometry())
+
+    # -- projects -----------------------------------------------------------
+    def _apply_document(self, params: Params, path: Optional[str], page: int = 0,
+                        dpi: int = 200, render: bool = True):
+        """Put a whole document on screen: settings, palette, photo. Undo starts over."""
+        self.params = params
+        self._undo.clear()
+        self._redo.clear()
+        self._update_history_actions()
+        self.controls.apply(self.params)
+        self.palette_panel.set_palette(self.params.palette)
+        self.act_eyedrop.setChecked(False)
+        self._path = path if (path and os.path.exists(path)) else None
+        if self._path:
+            if is_pdf(self._path):
+                try:
+                    pages = count_pdf_pages(self._path)
+                except Exception:  # noqa: BLE001 - a broken PDF shouldn't block opening
+                    pages = 0
+                self.upload.set_pdf_pages(pages)
+                self.upload.set_pdf_state(page, dpi)
+            else:
+                self.upload.hide_pdf()
+            self.statusBar().showMessage(f"Loading {os.path.basename(self._path)}…")
+            self.request_load.emit(self._path, self.upload.current_page(), self.upload.current_dpi())
+        else:
+            self.upload.clear()
+            self.request_clear.emit()
+            if render:
+                self._render_now()
+        self.preview.zoom_fit()
+
+    def _doc_key(self):
+        """Everything a save captures. Clicks that only highlight don't count as edits."""
+        p = self.params.copy(eyedropper_mode=False, selected_target=-1,
+                             selected_pass=-1, selected_color=-1)
+        pdf = bool(self._path and is_pdf(self._path))
+        return (p, self._path or "",
+                self.upload.current_page() if pdf else 0,
+                self.upload.current_dpi() if pdf else 0)
+
+    def _is_dirty(self) -> bool:
+        return self._saved_key is not None and self._doc_key() != self._saved_key
+
+    def _needs_saving(self) -> bool:
+        """Before replacing what's on screen: a changed project, or untitled work with a photo."""
+        return self._is_dirty() or (self.project is None and self._path is not None)
+
+    def _mark_saved(self):
+        self._saved_key = self._doc_key()
+        self._update_title()
+
+    def _update_title(self):
+        name = self.project.name if self.project else "Untitled"
+        self.setWindowTitle(f"{name}[*] — Painting Studio")
+        self.setWindowModified(self._is_dirty())
+
+    def _maybe_save(self) -> bool:
+        """Ask before unsaved work is replaced. False means stop what you were doing."""
+        if not self._needs_saving():
+            return True
+        answer = projects.ask_save_changes(self, self.project.name if self.project else "Untitled")
+        if answer == projects.CANCEL:
+            return False
+        if answer == projects.SAVE:
+            return self._save()
+        return True
+
+    def _document(self) -> dict:
+        p = self.params.copy(eyedropper_mode=False, selected_target=-1,
+                             selected_pass=-1, selected_color=-1)
+        return {"params": params_to_dict(p), "page": self.upload.current_page(),
+                "dpi": self.upload.current_dpi()}
+
+    def _external_photo(self) -> Optional[str]:
+        """The photo on screen, if it isn't already this project's own copy."""
+        if not self._path:
+            return None
+        if self.project is not None:
+            inside = os.path.abspath(self._path).startswith(os.path.abspath(self.project.path) + os.sep)
+            if inside:
+                return None
+        return self._path
+
+    def _new_project(self):
+        if not self._maybe_save():
+            return
+        self.project = None
+        self._apply_document(self._with_own_palette(Params()), None)
+        self._mark_saved()
+        self.statusBar().showMessage(
+            "New project — open a reference photo, then Save (⌘S) to keep it.")
+
+    def _open_project_dialog(self):
+        dlg = projects.OpenProjectDialog(self, self.lib, self.project.id if self.project else "")
+        if dlg.exec() == dlg.Accepted and dlg.chosen():
+            self._open_project(dlg.chosen())
+
+    def _open_project(self, pid: str, ask: bool = True):
+        if self.project is not None and pid == self.project.id and not self._is_dirty():
+            return
+        if ask and not self._maybe_save():
+            return
+        proj = projects.project_or_none(self.lib, pid)
+        if proj is None:
+            QMessageBox.warning(self, "Open project", "That project can't be found any more.")
+            projects.remove_recent(pid)
+            self._rebuild_recent_menu()
+            return
+        doc = proj.document or {}
+        if doc.get("params"):
+            params = params_from_dict(doc["params"])
+        else:
+            # Started in the Easel: open with its palette and a fresh board.
+            pal = palette_or_first(self.lib, proj.palette)
+            params = Params().copy(palette=pal.paints, medium=pal.medium)
+        self.project = proj
+        self._apply_document(params, self.lib.reference_path(proj),
+                             int(doc.get("page", 0)), int(doc.get("dpi", 200)))
+        projects.add_recent(pid)
+        QSettings().setValue(projects.LAST_KEY, pid)
+        self._rebuild_recent_menu()
+        self._mark_saved()
+        self.statusBar().showMessage(f"Opened “{proj.name}”.")
+
+    def _save(self) -> bool:
+        if self.project is None:
+            return self._save_as()
+        try:
+            self.project = self.lib.save_document(self.project.id, self._document(),
+                                                  self._external_photo())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Save", f"Couldn't save: {exc}")
+            return False
+        self._path = self.lib.reference_path(self.project) or self._path
+        self._after_save(f"Saved “{self.project.name}”.")
+        return True
+
+    def _save_as(self) -> bool:
+        if self.project is not None:
+            default = f"{self.project.name} copy"
+        elif self._path:
+            default = os.path.splitext(os.path.basename(self._path))[0]
+        else:
+            default = "Untitled"
+        name, ok = QInputDialog.getText(self, "Save project", "Project name:", text=default)
+        name = name.strip()
+        if not ok or not name:
+            return False
+        photo = self._external_photo()          # decided before the project changes
+        try:
+            if self.project is not None:
+                new = self.lib.duplicate_project(self.project.id, name)
+            else:
+                pal = self.lib.default_palette_name() or next(iter(self.lib.palettes()), "")
+                new = self.lib.create_project(name, pal, None, self.params.paper_w,
+                                              self.params.paper_h, self.params.canvas_units)
+            self.project = self.lib.save_document(new.id, self._document(), photo)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Save As", f"Couldn't save: {exc}")
+            return False
+        self._path = self.lib.reference_path(self.project) or self._path
+        self._after_save(f"Saved as “{self.project.name}”.")
+        return True
+
+    def _after_save(self, message: str):
+        projects.add_recent(self.project.id)
+        QSettings().setValue(projects.LAST_KEY, self.project.id)
+        self._rebuild_recent_menu()
+        self._mark_saved()
+        self.statusBar().showMessage(message)
+        if self._easel is not None:
+            self._easel.refresh_projects()       # a new project, or its photo changed
+
+    def _rebuild_recent_menu(self):
+        self.recent_menu.clear()
+        recent = projects.recent_projects(self.lib)
+        if not recent:
+            none = self.recent_menu.addAction("No recent projects")
+            none.setEnabled(False)
+            return
+        for proj in recent:
+            act = self.recent_menu.addAction(proj.name)
+            act.triggered.connect(lambda _=False, pid=proj.id: self._open_project(pid))
+        self.recent_menu.addSeparator()
+        clear = self.recent_menu.addAction("Clear Menu")
+        clear.triggered.connect(self._clear_recent)
+
+    def _clear_recent(self):
+        QSettings().setValue(projects.RECENT_KEY, [])
+        self._rebuild_recent_menu()
 
     # -- file handling ------------------------------------------------------
     def _choose_file(self):
@@ -306,6 +534,15 @@ class MainWindow(QMainWindow):
             self._load_path(path)
 
     def _load_path(self, path: str):
+        if self.project is not None and self._external_photo() is None and self._path:
+            fresh = projects.project_or_none(self.lib, self.project.id)
+            n = len(fresh.swatches) if fresh else 0
+            if n and QMessageBox.question(
+                    self, "Replace reference photo",
+                    f"“{self.project.name}” has {n} Easel swatch{'es' if n != 1 else ''}. "
+                    "They keep their colours and recipes, but once you save, their "
+                    "outlines will point at the new photo. Replace it?") != QMessageBox.Yes:
+                return
         self._path = path
         if is_pdf(path):
             try:
@@ -588,6 +825,7 @@ class MainWindow(QMainWindow):
         self.act_grid.setVisible(is_mosaic)
         self.act_grid.setEnabled(is_mosaic and result.mosaic is not None)
         self.progress.setVisible(False)
+        self._update_title()
         note = ", ".join(result.recomputed) if result.recomputed else "style only"
         if self.params.doc_mode == DOC_PLAN and not result.passes and not self._path:
             self.statusBar().showMessage("Open a reference photo to build a painting plan.")
@@ -679,8 +917,10 @@ class MainWindow(QMainWindow):
     def _open_easel(self):
         from .easel_window import EaselWindow
 
-        if getattr(self, "_easel", None) is None:
-            self._easel = EaselWindow()
+        if self._easel is None:
+            self._easel = EaselWindow(library=self.lib)
+        if self.project is not None:
+            self._easel.show_project(self.project.id)
         self._easel.show()
         self._easel.raise_()
         self._easel.activateWindow()
@@ -719,6 +959,13 @@ class MainWindow(QMainWindow):
 
     # -- shutdown -----------------------------------------------------------
     def closeEvent(self, event):
+        # A project with unsaved changes asks first. The untitled workspace
+        # doesn't: it restores itself next launch, so nothing can be lost.
+        if self.project is not None and self._is_dirty():
+            answer = projects.ask_save_changes(self, self.project.name)
+            if answer == projects.CANCEL or (answer == projects.SAVE and not self._save()):
+                event.ignore()
+                return
         self._save_session()
         self._thread.quit()
         self._thread.wait(3000)

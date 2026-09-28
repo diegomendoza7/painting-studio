@@ -45,6 +45,15 @@ def _params_from_jsonable(d: dict) -> Params:
     return Params(**data)
 
 
+# Public names for the same conversion — a project's saved document uses it too.
+def params_to_dict(p: Params) -> dict:
+    return _params_to_jsonable(p)
+
+
+def params_from_dict(d: dict) -> Params:
+    return _params_from_jsonable(d or {})
+
+
 def encode_session(*, path: Optional[str], page: int, dpi: int, params: Params) -> str:
     """Serialize the full session state to a JSON string for ``QSettings``."""
     return json.dumps(

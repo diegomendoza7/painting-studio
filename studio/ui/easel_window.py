@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSettings, QStandardPaths, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -63,6 +63,7 @@ from ..params import UNIT_CM, UNIT_IN
 from ..pipeline.loader import load, normalize
 from ..pipeline.plan_schedule import parts_text
 from ..pipeline.solver import solve_targets
+from . import projects
 from .palette_panel import PalettePanel
 from .render import ndarray_to_qimage
 
@@ -85,6 +86,14 @@ def library_root() -> str:
 
 
 # --- the swatch card ---------------------------------------------------------------
+def _file_stamp(path: Optional[str]):
+    """Which file, and which version of it — to notice a replaced photo."""
+    try:
+        return (path, os.path.getmtime(path)) if path else None
+    except OSError:
+        return None
+
+
 @dataclass
 class SwatchCard:
     title: str
@@ -490,6 +499,7 @@ class EaselWindow(QMainWindow):
         self.analysis: Optional[easel.Analysis] = None
         self.display_rgb: Optional[np.ndarray] = None
         self.current: Optional[str] = None       # swatch id on show
+        self._ref_stamp = None                   # which reference file is loaded
         self._syncing = False
 
         self._build()
@@ -740,11 +750,11 @@ class EaselWindow(QMainWindow):
     def _reload_projects(self, select: str = ""):
         self._syncing = True
         self.project_combo.clear()
-        projects = self.lib.projects()
-        for proj in projects:
+        found = self.lib.projects()
+        for proj in found:
             self.project_combo.addItem(proj.name, proj.id)
         self._syncing = False
-        if not projects:
+        if not found:
             self.project = None
             self.canvas.set_placeholder("Start a painting — click here, or New Painting… (⌘N)")
             self._refresh_history()
@@ -759,9 +769,46 @@ class EaselWindow(QMainWindow):
         if not self._syncing and self.project_combo.currentData():
             self._open_project(self.project_combo.currentData())
 
+    def show_project(self, pid: str):
+        """The document window's Easel button: show the painting open there."""
+        if self.project is not None and self.project.id == pid:
+            self.refresh_projects()
+        else:
+            self._reload_projects(select=pid)
+
+    def refresh_projects(self):
+        """Another window added a painting or changed one's photo: catch up quietly.
+
+        The painting on screen stays open, with its swatch still showing, unless
+        its reference photo is no longer the one this window loaded.
+        """
+        cur = self.project
+        fresh = projects.project_or_none(self.lib, cur.id) if cur else None
+        if fresh is None:
+            return self._reload_projects()
+        listed = [(p.name, p.id) for p in self.lib.projects()]
+        combo = self.project_combo
+        if listed != [(combo.itemText(i), combo.itemData(i)) for i in range(combo.count())]:
+            self._syncing = True
+            combo.clear()
+            for name, pid in listed:
+                combo.addItem(name, pid)
+            combo.setCurrentIndex(max(0, combo.findData(cur.id)))
+            self._syncing = False
+        if _file_stamp(self.lib.reference_path(fresh)) != self._ref_stamp:
+            self._open_project(cur.id)
+
+    def changeEvent(self, event):
+        # The document window may be another process (the two launchers), so
+        # coming back to this window is when to notice what it saved.
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow() and self.project:
+            self.refresh_projects()
+        super().changeEvent(event)
+
     def _open_project(self, pid: str):
         self.project = self.lib.load_project(pid)
         QSettings().setValue("easel/project", pid)
+        projects.add_recent(pid)
         self.current = None
         self._reload_palettes(select=self.project.palette)
         self._load_reference()
@@ -770,6 +817,7 @@ class EaselWindow(QMainWindow):
 
     def _load_reference(self):
         path = self.lib.reference_path(self.project) if self.project else None
+        self._ref_stamp = _file_stamp(path)
         if not path:
             self.analysis = self.display_rgb = None
             self.canvas.set_placeholder("Add the reference photo — click here, or Reference…")

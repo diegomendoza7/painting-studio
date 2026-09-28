@@ -159,6 +159,30 @@ Keys: **Space** back to the photo · **Esc** back, then clear the selection ·
 **V** value · **E** Area ↔ Eyedropper · **⌫** delete swatch · **⌘N** new painting ·
 **⌘F** search · **⌃⌘F** full screen.
 
+## Projects
+
+One project is one painting: its reference photo, the document's settings
+(board, plan or mosaic, palette, every control) and the Easel's swatches, kept
+together so you can leave a painting half-done, start another, and come back to
+either exactly as you left it.
+
+- **File → New Project** (⌘N), **Open…** (⌘O, with a thumbnail of each
+  painting), **Open Recent** (also the ▾ beside the toolbar's Open), **Save**
+  (⌘S), **Save As…** (⇧⌘S — a full copy, swatches included), and
+  **Reference Photo…** (⇧⌘O) to change the photo.
+- The title shows the project's name, and a dot on the close button when it has
+  unsaved changes. Switching project or quitting asks first — Save, Don't Save,
+  or Cancel. Clicking to highlight a colour or wash is not an edit.
+- Launching reopens the last project. Work you never saved stays in the untitled
+  workspace, which restores itself as before.
+- The Easel and the document window share projects: the Easel button opens the
+  Easel on the painting you have open, a painting started in the Easel opens here
+  with its palette, and each window saves only its own half, so neither can undo
+  the other's work — even when they run as two separate apps.
+
+Projects live in `~/Documents/Painting Studio/projects/`, the same folders as
+the Easel's paintings. The photo is copied in on the first save.
+
 ## Run
 
 ```bash
@@ -182,7 +206,7 @@ python main.py --easel    # straight to the easel
    **Export Cartoon** prints the numbered stones at true tessera size across
    however many sheets that takes.
 
-Sessions auto-restore on launch. Undo/redo covers every edit. Saved presets
+The last project reopens on launch. Undo/redo covers every edit. Saved presets
 capture the board/solver "look" but never overwrite your palette.
 
 ## How mixing works

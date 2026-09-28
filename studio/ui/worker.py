@@ -49,6 +49,12 @@ class Worker(QObject):
         except Exception as exc:  # noqa: BLE001 - last-resort guard
             self.failed.emit(f"Could not load file: {exc}")
 
+    @Slot()
+    def clear_source(self) -> None:
+        """Forget the photo — a new, empty project. Queued like every other
+        request, so it can never land in the middle of a render."""
+        self.pipeline.clear_source()
+
     @Slot(object)
     def process(self, req: RenderRequest) -> None:
         def report(label: str, frac: float) -> None:

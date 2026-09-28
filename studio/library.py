@@ -18,6 +18,11 @@ Three rules keep it trustworthy over months of use:
   palette later doesn't rewrite history; "re-mix" is an explicit action.
 * **Writes are atomic** (temp file + rename), so a crash mid-save can't leave a
   half-written ``project.json`` and lose a painting's history.
+* **Each window writes only its own part.** A project is shared: the Easel owns
+  its swatches, palette and canvas; the document window owns ``document`` (its
+  board / plan / mosaic settings). They can run as separate programs, so every
+  save re-reads the other part from disk rather than writing back a stale copy
+  — otherwise saving in one would silently erase work done in the other.
 
 Qt-free, so the smoke suite can exercise it against a temp directory.
 """
@@ -118,6 +123,9 @@ class Project:
     swatches: List[Swatch] = field(default_factory=list)
     created: str = ""
     updated: str = ""
+    # The document window's saved state: {"params": …, "page": int, "dpi": int}.
+    # None until the project has been saved from there.
+    document: Optional[dict] = None
     path: str = ""                   # absolute folder; not serialized
 
     def swatch(self, sid: str) -> Optional[Swatch]:
@@ -198,6 +206,7 @@ def _project_to_dict(p: Project) -> dict:
         "reference": p.reference, "tolerance": p.tolerance,
         "created": p.created, "updated": p.updated,
         "swatches": [_swatch_to_dict(s) for s in p.swatches],
+        "document": p.document,
     }
 
 
@@ -214,6 +223,7 @@ def _project_from_dict(d: dict, path: str) -> Project:
         swatches=[_swatch_from_dict(s) for s in d.get("swatches", [])],
         created=d.get("created", ""),
         updated=d.get("updated", ""),
+        document=d.get("document") if isinstance(d.get("document"), dict) else None,
         path=path,
     )
 
@@ -330,10 +340,57 @@ class Library:
         self.save_project(proj)
         return proj
 
-    def save_project(self, proj: Project) -> None:
+    def save_project(self, proj: Project, keep_document: bool = True) -> None:
+        """Write a project. ``document`` is taken from disk unless this save owns it.
+
+        The Easel saves through here on every swatch; if it wrote back the
+        ``document`` it loaded hours ago it would undo the document window's
+        saves. For the same reason a reference file that has vanished from under
+        a stale in-memory copy is replaced by whatever the file on disk names.
+        """
+        path = os.path.join(proj.path, "project.json")
+        disk: dict = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    disk = json.load(fh) or {}
+            except (OSError, ValueError):
+                disk = {}
+        if keep_document and disk:
+            proj.document = disk.get("document") if isinstance(disk.get("document"), dict) else None
+        on_disk_ref = disk.get("reference", "")
+        if (proj.reference and on_disk_ref and on_disk_ref != proj.reference
+                and not os.path.isfile(os.path.join(proj.path, proj.reference))
+                and os.path.isfile(os.path.join(proj.path, on_disk_ref))):
+            proj.reference = on_disk_ref
         proj.updated = _now()
-        _atomic_write(os.path.join(proj.path, "project.json"),
-                      json.dumps(_project_to_dict(proj), indent=2))
+        _atomic_write(path, json.dumps(_project_to_dict(proj), indent=2))
+
+    def save_document(self, pid: str, document: dict, reference_src: Optional[str] = None) -> Project:
+        """Save the document window's part of a project, leaving the Easel's alone.
+
+        Loads the project fresh from disk first, so swatches the Easel made since
+        the document window opened it are kept. ``reference_src`` replaces the
+        reference photo (copied in) when the document window opened a new one.
+        """
+        proj = self.load_project(pid)
+        if reference_src:
+            self.set_reference(proj, reference_src, save=False)
+        proj.document = document
+        self.save_project(proj, keep_document=False)
+        return proj
+
+    def duplicate_project(self, pid: str, name: str) -> Project:
+        """A full copy of a project under a new name — what Save As does."""
+        src = os.path.join(self.projects_dir, pid)
+        new_id = f"{_slug(name)}-{uuid.uuid4().hex[:6]}"
+        dst = os.path.join(self.projects_dir, new_id)
+        shutil.copytree(src, dst)
+        proj = self.load_project(new_id)
+        proj.id, proj.name, proj.path = new_id, name.strip() or "Untitled", dst
+        proj.created = _now()
+        self.save_project(proj)
+        return proj
 
     def delete_project(self, pid: str) -> None:
         path = os.path.join(self.projects_dir, pid)

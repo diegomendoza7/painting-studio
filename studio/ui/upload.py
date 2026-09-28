@@ -79,6 +79,13 @@ class UploadPanel(QWidget):
         self.drop.setPixmap(scaled)
         self.info.setText(caption)
 
+    def clear(self):
+        """Back to the empty drop zone — a project with no photo yet."""
+        self.drop.clear()
+        self.drop.setText("Drop a reference photo here")
+        self.info.setText("")
+        self.hide_pdf()
+
     def set_pdf_pages(self, count: int):
         self._suppress = True
         self.page_combo.clear()
