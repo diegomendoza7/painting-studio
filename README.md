@@ -251,3 +251,9 @@ Pigment mixing uses **Mixbox** © Secret Weapons, licensed
 board. If this app is ever distributed commercially, the mixing engine in
 `studio/mixer.py` must be replaced or a commercial Mixbox license obtained
 (mixbox@scrtwpns.com).
+
+## About this history
+
+Built locally between June and September 2026. Uploaded to GitHub on October 6, 2026. Commit dates reflect when the work was done on my machine. History is reconstructed from file timestamps and session logs, so early intermediate versions may be missing.
+
+The first commit is the exact snapshot staged in git on June 10.
