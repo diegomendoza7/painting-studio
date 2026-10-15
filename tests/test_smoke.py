@@ -1886,12 +1886,15 @@ def group35_projects():
         mw._open_project(pid)
         check(mw.project.id == pid and mw.params.extract_n == saved.extract_n,
               "Open restores the project's settings")
-        check(mw._path == envlib.reference_path(mw.project), "and its photo")
+        check(wait(lambda: not mw._loading_file) and mw._path == envlib.reference_path(mw.project),
+              "and its photo loads successfully")
         check(not mw._is_dirty(), "and opens clean")
 
         # A second project; the Easel adds a swatch to the first meanwhile.
         mw._new_project()
         mw._load_path(photo2)
+        check(wait(lambda: not mw._loading_file and mw._path == photo2),
+              "the second reference loads before Save As")
         names.append("Bands")
         mw._save_as()
         pid2 = mw.project.id
@@ -1913,6 +1916,7 @@ def group35_projects():
         mw._open_project(pid)
         check(mw.project.id == pid, "Discard opens the other one")
         check(len(envlib.load_project(pid).swatches) == 1, "the Easel's swatch was never touched")
+        check(wait(lambda: not mw._loading_file), "the reopened reference loads before making a copy")
         n_before = len(os.listdir(envlib.projects_dir))
         names.append("Still life (warm)")
         mw._save_as()
@@ -1928,6 +1932,8 @@ def group35_projects():
         mw._new_project()
         mw._load_path(photo)
         names.append("Fresh")
+        check(wait(lambda: not mw._loading_file and mw._path == photo),
+              "the new reference loads before saving")
         mw._save_as()
         check(ew.project_combo.findData(mw.project.id) >= 0, "a project saved here appears in the Easel")
         check(ew.project.id == pid, "without switching the painting the Easel is on")

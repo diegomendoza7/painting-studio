@@ -6,7 +6,7 @@ import os
 import time
 from typing import Optional
 
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QMenu,
@@ -64,9 +64,10 @@ def _in_rect(x: float, y: float, rect) -> bool:
 
 
 class MainWindow(QMainWindow):
-    request_load = Signal(str, int, int)   # path, page, dpi
+    request_load = Signal(str, int, int, int)
+    request_adopt = Signal(object, int)
     request_process = Signal(object)       # RenderRequest
-    request_clear = Signal()               # forget the photo (new, empty project)
+    request_clear = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -81,10 +82,23 @@ class MainWindow(QMainWindow):
         self.lib = Library(library_root())
         self.project = None
         self._saved_key = None
+        self._baseline_params = None
         self._easel = None
         self._busy = False
         self._pending = False
         self._result: Optional[Result] = None
+        self._revision = 0
+        self._inflight_state = None
+        self._result_state = None
+        self._load_token = 0
+        self._source_token = 0
+        self._loading_file = False
+        self._mark_on_load = False
+        self._committed_pdf = (0, 200, 0)
+        self._requested_pdf = self._committed_pdf
+        self._loading_path = None
+        self._closing = False
+        self._shutdown_done = False
         # Undo/redo of parameter edits. Each entry is one immutable Params;
         # _push_history records the pre-edit state at the start of each gesture.
         self._undo: list = []
@@ -272,12 +286,15 @@ class MainWindow(QMainWindow):
         self._worker = Worker()
         self._worker.moveToThread(self._thread)
         self.request_load.connect(self._worker.load_source)
+        self.request_adopt.connect(self._worker.adopt_source)
         self.request_clear.connect(self._worker.clear_source)
         self.request_process.connect(self._worker.process)
         self._worker.source_loaded.connect(self._on_source_loaded)
+        self._worker.load_failed.connect(self._on_load_failed)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.progress.connect(self._on_progress)
+        self._thread.finished.connect(self._finish_close)
         self._thread.start()
 
     # -- session persistence (auto-restore) ---------------------------------
@@ -344,22 +361,34 @@ class MainWindow(QMainWindow):
         self.controls.apply(self.params)
         self.palette_panel.set_palette(self.params.palette)
         self.act_eyedrop.setChecked(False)
-        self._path = path if (path and os.path.exists(path)) else None
-        if self._path:
-            if is_pdf(self._path):
+        self._revision += 1
+        self._load_token += 1
+        self._source_token = self._load_token
+        self._loading_file = False
+        self._mark_on_load = False
+        self._loading_path = None
+        self._path = None
+        self._result = None
+        self._result_state = None
+        self._committed_pdf = (0, dpi, 0)
+        self._set_export_enabled(False)
+        self.preview.clear("Building the document…")
+        self.request_clear.emit(self._source_token)
+        if path and os.path.exists(path):
+            self._mark_on_load = True
+            if is_pdf(path):
                 try:
-                    pages = count_pdf_pages(self._path)
+                    pages = count_pdf_pages(path)
                 except Exception:  # noqa: BLE001 - a broken PDF shouldn't block opening
                     pages = 0
                 self.upload.set_pdf_pages(pages)
                 self.upload.set_pdf_state(page, dpi)
             else:
                 self.upload.hide_pdf()
-            self.statusBar().showMessage(f"Loading {os.path.basename(self._path)}…")
-            self.request_load.emit(self._path, self.upload.current_page(), self.upload.current_dpi())
+            self.statusBar().showMessage(f"Loading {os.path.basename(path)}…")
+            self._request_load(path, self.upload.current_page(), self.upload.current_dpi())
         else:
             self.upload.clear()
-            self.request_clear.emit()
             if render:
                 self._render_now()
         self.preview.zoom_fit()
@@ -382,6 +411,7 @@ class MainWindow(QMainWindow):
 
     def _mark_saved(self):
         self._saved_key = self._doc_key()
+        self._baseline_params = params_to_dict(self.params)
         self._update_title()
 
     def _update_title(self):
@@ -444,6 +474,12 @@ class MainWindow(QMainWindow):
         doc = proj.document or {}
         if doc.get("params"):
             params = params_from_dict(doc["params"])
+            pal = self.lib.palette(proj.palette)
+            if pal is not None:
+                params = params.copy(palette=pal.paints, medium=pal.medium)
+            if proj.canvas_w > 0 and proj.canvas_h > 0:
+                params = params.copy(paper_w=proj.canvas_w, paper_h=proj.canvas_h,
+                                     canvas_units=proj.units)
         else:
             # Started in the Easel: open with its palette and a fresh board.
             pal = palette_or_first(self.lib, proj.palette)
@@ -458,19 +494,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Opened “{proj.name}”.")
 
     def _save(self) -> bool:
+        if self._loading_file:
+            self.statusBar().showMessage("Wait for the reference photo to finish loading before saving.")
+            return False
         if self.project is None:
             return self._save_as()
         try:
             self.project = self.lib.save_document(self.project.id, self._document(),
-                                                  self._external_photo())
+                                                  self._external_photo(),
+                                                  {"params": self._baseline_params})
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Save", f"Couldn't save: {exc}")
             return False
         self._path = self.lib.reference_path(self.project) or self._path
+        saved = params_from_dict(self.project.document["params"])
+        new = self.params.copy(palette=saved.palette, medium=saved.medium,
+                               paper_w=saved.paper_w, paper_h=saved.paper_h,
+                               canvas_units=saved.canvas_units)
+        if new != self.params:
+            self.params = new
+            self.controls.apply(new)
+            self.palette_panel.set_palette(new.palette)
+            self._render_now()
         self._after_save(f"Saved “{self.project.name}”.")
         return True
 
     def _save_as(self) -> bool:
+        if self._loading_file:
+            self.statusBar().showMessage("Wait for the reference photo to finish loading before saving.")
+            return False
         if self.project is not None:
             default = f"{self.project.name} copy"
         elif self._path:
@@ -525,6 +577,17 @@ class MainWindow(QMainWindow):
         self._rebuild_recent_menu()
 
     # -- file handling ------------------------------------------------------
+    def _request_load(self, path: str, page: int, dpi: int):
+        if self._closing:
+            return
+        self._load_token += 1
+        self._revision += 1
+        self._loading_file = True
+        self._loading_path = path
+        self._requested_pdf = (page, dpi, self.upload.page_combo.count() if is_pdf(path) else 0)
+        self._set_export_enabled(False)
+        self.request_load.emit(path, page, dpi, self._load_token)
+
     def _choose_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open reference photo", "",
@@ -543,7 +606,6 @@ class MainWindow(QMainWindow):
                     "They keep their colours and recipes, but once you save, their "
                     "outlines will point at the new photo. Replace it?") != QMessageBox.Yes:
                 return
-        self._path = path
         if is_pdf(path):
             try:
                 pages = count_pdf_pages(path)
@@ -554,16 +616,33 @@ class MainWindow(QMainWindow):
         else:
             self.upload.hide_pdf()
         self.statusBar().showMessage(f"Loading {os.path.basename(path)}…")
-        self.request_load.emit(path, self.upload.current_page(), self.upload.current_dpi())
+        self._mark_on_load = False
+        self._request_load(path, self.upload.current_page(), self.upload.current_dpi())
 
     def _reload_page(self):
-        if self._path and is_pdf(self._path):
+        path = self._loading_path if self._loading_file else self._path
+        if path and is_pdf(path):
             self.statusBar().showMessage("Loading page…")
-            self.request_load.emit(
-                self._path, self.upload.current_page(), self.upload.current_dpi()
+            self._request_load(
+                path, self.upload.current_page(), self.upload.current_dpi()
             )
 
-    def _on_source_loaded(self, loaded):
+    def _on_source_loaded(self, loaded, token=None):
+        if self._closing or (token is not None and token != self._load_token):
+            return
+        self._loading_file = False
+        self._loading_path = None
+        self._path = loaded.source_path
+        if self._mark_on_load:
+            self._mark_on_load = False
+            self._mark_saved()
+        self._source_token = self._load_token if token is None else token
+        self._committed_pdf = (loaded.page_index, self._requested_pdf[1], self._requested_pdf[2])
+        self.upload.set_pdf_state(*self._committed_pdf[:2])
+        self.request_adopt.emit(loaded, self._source_token)
+        self._result = None
+        self._result_state = None
+        self.preview.clear("Building the document…")
         qimg = ndarray_to_qimage(loaded.rgb)
         w, h = loaded.size
         self.upload.set_thumbnail(
@@ -573,9 +652,23 @@ class MainWindow(QMainWindow):
         # Targets are colors, not geometry — they stay valid across photo swaps.
         self._render_now()
 
+    def _on_load_failed(self, message: str, token: int):
+        if self._closing or token != self._load_token:
+            return
+        self._loading_file = False
+        self._loading_path = None
+        self._mark_on_load = False
+        page, dpi, pages = self._committed_pdf
+        self.upload.set_pdf_pages(pages)
+        self.upload.set_pdf_state(page, dpi)
+        QMessageBox.warning(self, "Open reference", message)
+        self._render_now()
+
     # -- undo / redo of parameter edits --------------------------------------
     def _push_history(self):
         now = time.monotonic()
+        self._redo.clear()
+        self._update_history_actions()
         if self._undo and (now - self._hist_t) < HISTORY_COALESCE_S:
             self._hist_t = now            # still mid-burst — keep the pre-gesture entry
             return
@@ -585,19 +678,20 @@ class MainWindow(QMainWindow):
         self._undo.append(self.params)
         if len(self._undo) > HISTORY_MAX:
             self._undo.pop(0)
-        self._redo.clear()
         self._update_history_actions()
 
     def _do_undo(self):
         if not self._undo:
             return
         self._redo.append(self.params)
+        self._hist_t = 0.0
         self._restore_snapshot(self._undo.pop())
 
     def _do_redo(self):
         if not self._redo:
             return
         self._undo.append(self.params)
+        self._hist_t = 0.0
         self._restore_snapshot(self._redo.pop())
 
     def _restore_snapshot(self, snap: Params):
@@ -618,11 +712,13 @@ class MainWindow(QMainWindow):
     def _on_controls_changed(self):
         self._push_history()   # coalesced: one undo entry per edit gesture
         self.params = self.controls.collect(self.params)
+        self._set_export_enabled(False)
         self._timer.start()
 
     def _on_palette_changed(self, palette):
         self._push_history()
         self.params = self.params.copy(palette=tuple(palette))
+        self._set_export_enabled(False)
         self._timer.start()
 
     def _on_starter_set(self):
@@ -794,33 +890,48 @@ class MainWindow(QMainWindow):
 
     # -- render scheduling --------------------------------------------------
     def _render_now(self):
+        if self._closing:
+            return
+        self._revision += 1
+        self._set_export_enabled(False)
         self._pending = True
-        if not self._busy:
+        if not self._busy and not self._loading_file:
             self._dispatch()
 
     def _dispatch(self):
-        if not self._pending:
+        if not self._pending or self._closing or self._loading_file:
             return
         self._pending = False
         self._busy = True
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        self.request_process.emit(RenderRequest(params=self.params))
+        self._inflight_state = self.params
+        self.request_process.emit(RenderRequest(params=self.params, revision=self._revision,
+                                                source_token=self._source_token))
 
     # -- worker callbacks ---------------------------------------------------
     def _on_progress(self, label: str, frac: float):
+        if self._closing or self._loading_file:
+            return
         self.statusBar().showMessage(label)
         self.progress.setValue(int(frac * 100))
 
-    def _on_finished(self, result: Result):
+    def _on_finished(self, result: Result, revision=None):
         self._busy = False
+        if self._closing:
+            return
+        if (result is None or self._loading_file or
+                (revision is not None and (revision != self._revision or
+                 self._inflight_state != self.params))):
+            if self._pending:
+                self._dispatch()
+            return
         self._result = result
+        self._result_state = self.params
         scene = result.scene
         image = render_scene(scene, 1.0)
         self.preview.set_image(image, scene.width, scene.height, scene.margin)
-        self.act_svg.setEnabled(True)
-        self.act_png.setEnabled(True)
-        self.act_pdf.setEnabled(True)
+        self._set_export_enabled(True)
         is_mosaic = self.params.doc_mode == DOC_MOSAIC
         self.act_grid.setVisible(is_mosaic)
         self.act_grid.setEnabled(is_mosaic and result.mosaic is not None)
@@ -841,7 +952,15 @@ class MainWindow(QMainWindow):
             DOC_MOSAIC: "mosaic-guide",
         }.get(self.params.doc_mode, "palette-board")
 
-    def _on_failed(self, message: str):
+    def _on_failed(self, message: str, revision=None):
+        if self._closing:
+            return
+        if revision is not None and (revision != self._revision or self._loading_file
+                                     or self._inflight_state != self.params):
+            self._busy = False
+            if self._pending:
+                self._dispatch()
+            return
         self._busy = False
         self.progress.setVisible(False)
         self.statusBar().showMessage("Processing failed.")
@@ -850,8 +969,17 @@ class MainWindow(QMainWindow):
             self._dispatch()
 
     # -- export & reset -----------------------------------------------------
+    def _set_export_enabled(self, enabled: bool):
+        for action in (self.act_svg, self.act_png, self.act_pdf, self.act_grid):
+            action.setEnabled(enabled)
+
+    def _export_ready(self) -> bool:
+        return (self._result is not None and not self._closing and not self._busy
+                and not self._pending and not self._loading_file
+                and self._result_state == self.params)
+
     def _export_svg(self):
-        if not self._result:
+        if not self._export_ready():
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export SVG", f"{self._doc_stem()}.svg", "SVG (*.svg)")
@@ -865,7 +993,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export failed", str(exc))
 
     def _export_png(self):
-        if not self._result:
+        if not self._export_ready():
             return
         scene = self._result.scene
         longest = max(scene.width, scene.height)
@@ -889,7 +1017,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export failed", str(exc))
 
     def _export_pdf(self):
-        if not self._result:
+        if not self._export_ready():
             return
         scene = self._result.scene
         ipp = float(scene.inches_per_px)
@@ -927,7 +1055,7 @@ class MainWindow(QMainWindow):
 
     def _export_grid(self):
         """Write the numbered mosaic grid at true tessera size, tiled across pages."""
-        if not self._result or self._result.mosaic is None:
+        if not self._export_ready() or self._result.mosaic is None:
             return
         grid = self._result.mosaic
         sheet = build_grid_sheet(self.params, grid)
@@ -958,7 +1086,34 @@ class MainWindow(QMainWindow):
         self._render_now()
 
     # -- shutdown -----------------------------------------------------------
+    def changeEvent(self, event):
+        if (event.type() == QEvent.ActivationChange and self.isActiveWindow()
+                and self.project is not None and not self._closing
+                and not self._is_dirty() and not self._loading_file):
+            fresh = projects.project_or_none(self.lib, self.project.id)
+            if fresh is not None:
+                pal = self.lib.palette(fresh.palette)
+                changes = dict(paper_w=fresh.canvas_w, paper_h=fresh.canvas_h,
+                               canvas_units=fresh.units)
+                if pal is not None:
+                    changes.update(palette=pal.paints, medium=pal.medium)
+                new = self.params.copy(**changes)
+                self.project = fresh
+                if new != self.params:
+                    self.params = new
+                    self.controls.apply(new)
+                    self.palette_panel.set_palette(new.palette)
+                    self._mark_saved()
+                    self._render_now()
+        super().changeEvent(event)
+
     def closeEvent(self, event):
+        if self._shutdown_done:
+            super().closeEvent(event)
+            return
+        if self._closing:
+            event.ignore()
+            return
         # A project with unsaved changes asks first. The untitled workspace
         # doesn't: it restores itself next launch, so nothing can be lost.
         if self.project is not None and self._is_dirty():
@@ -967,6 +1122,17 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._save_session()
+        self._closing = True
+        self._timer.stop()
+        self._pending = False
+        self.setEnabled(False)
+        self.statusBar().showMessage("Finishing current processing before closing…")
+        self._thread.requestInterruption()
         self._thread.quit()
-        self._thread.wait(3000)
-        super().closeEvent(event)
+        event.ignore()
+        self._finish_close()
+
+    def _finish_close(self):
+        if self._closing and not self._shutdown_done and not self._thread.isRunning():
+            self._shutdown_done = True
+            QTimer.singleShot(0, self.close)

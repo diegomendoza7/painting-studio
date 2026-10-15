@@ -748,6 +748,8 @@ class EaselWindow(QMainWindow):
 
     # -- projects ---------------------------------------------------------------------------
     def _reload_projects(self, select: str = ""):
+        if not self._save_details(refresh=False):
+            return
         self._syncing = True
         self.project_combo.clear()
         found = self.lib.projects()
@@ -767,7 +769,10 @@ class EaselWindow(QMainWindow):
 
     def _on_project_chosen(self, _i):
         if not self._syncing and self.project_combo.currentData():
-            self._open_project(self.project_combo.currentData())
+            if not self._open_project(self.project_combo.currentData()) and self.project:
+                self._syncing = True
+                self.project_combo.setCurrentIndex(self.project_combo.findData(self.project.id))
+                self._syncing = False
 
     def show_project(self, pid: str):
         """The document window's Easel button: show the painting open there."""
@@ -782,6 +787,8 @@ class EaselWindow(QMainWindow):
         The painting on screen stays open, with its swatch still showing, unless
         its reference photo is no longer the one this window loaded.
         """
+        if not self._save_details(refresh=False):
+            return
         cur = self.project
         fresh = projects.project_or_none(self.lib, cur.id) if cur else None
         if fresh is None:
@@ -797,6 +804,17 @@ class EaselWindow(QMainWindow):
             self._syncing = False
         if _file_stamp(self.lib.reference_path(fresh)) != self._ref_stamp:
             self._open_project(cur.id)
+        else:
+            shared_changed = (fresh.palette, fresh.canvas_w, fresh.canvas_h, fresh.units) != (
+                cur.palette, cur.canvas_w, cur.canvas_h, cur.units)
+            shared_changed = shared_changed or self.lib.palette(fresh.palette) != self.palette
+            self.project = fresh
+            if shared_changed:
+                self._reload_palettes(select=fresh.palette)
+                sw = self._current_swatch()
+                if sw is not None:
+                    self._show(sw)
+            self._refresh_history()
 
     def changeEvent(self, event):
         # The document window may be another process (the two launchers), so
@@ -806,14 +824,23 @@ class EaselWindow(QMainWindow):
         super().changeEvent(event)
 
     def _open_project(self, pid: str):
-        self.project = self.lib.load_project(pid)
+        if not self._save_details(refresh=False):
+            return False
+        try:
+            project = self.lib.load_project(pid)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Open painting", str(exc))
+            return False
+        self.project = project
         QSettings().setValue("easel/project", pid)
         projects.add_recent(pid)
         self.current = None
+        self._fill_details(None)
         self._reload_palettes(select=self.project.palette)
         self._load_reference()
         self._refresh_history()
         self.setWindowTitle(f"Easel — {self.project.name}")
+        return True
 
     def _load_reference(self):
         path = self.lib.reference_path(self.project) if self.project else None
@@ -832,6 +859,8 @@ class EaselWindow(QMainWindow):
         self.canvas.set_photo(self.display_rgb)
 
     def _new_painting(self):
+        if not self._save_details(refresh=False):
+            return
         dlg = PaintingDialog(self, sorted(self.lib.palettes()),
                              default=self.lib.default_palette_name())
         if dlg.exec() != QDialog.Accepted:
@@ -853,6 +882,8 @@ class EaselWindow(QMainWindow):
             self._change_reference()
 
     def _painting_settings(self):
+        if not self._save_details(refresh=False):
+            return
         if self.project is None:
             return self._new_painting()
         dlg = PaintingDialog(self, sorted(self.lib.palettes()), self.project)
@@ -867,6 +898,8 @@ class EaselWindow(QMainWindow):
         self._reload_projects(select=self.project.id)
 
     def _change_reference(self):
+        if not self._save_details(refresh=False):
+            return
         if self.project is None:
             return self._new_painting()
         path, _ = QFileDialog.getOpenFileName(
@@ -927,7 +960,8 @@ class EaselWindow(QMainWindow):
     def _on_picked(self, nx: float, ny: float, alt: bool):
         if self.project is None or self.analysis is None:
             return
-        self._save_details(refresh=False)
+        if not self._save_details(refresh=False):
+            return
         kind = self._kind_for_click(alt)
         if kind == easel.KIND_PIXEL:
             pk = easel.pick_pixel(self.analysis, self.display_rgb, nx, ny)
@@ -962,7 +996,8 @@ class EaselWindow(QMainWindow):
 
     def _show(self, sw: Swatch):
         if self.current and self.current != sw.id:
-            self._save_details(refresh=False)     # notes have no editingFinished
+            if not self._save_details(refresh=False):
+                return
         self.current = sw.id
         proj = self.project
         area = easel.canvas_cm2(proj.canvas_w, proj.canvas_h, proj.units)
@@ -1083,16 +1118,23 @@ class EaselWindow(QMainWindow):
     def _save_details(self, refresh: bool = True):
         sw = self._current_swatch()
         if self._syncing or sw is None:
-            return
+            return True
         name = self.name_edit.text().strip()
         tags = tuple(t.strip() for t in self.tags_edit.text().split(",") if t.strip())
         notes = self.notes_edit.toPlainText().strip()
         if (name, tags, notes) == (sw.name, sw.tags, sw.notes):
-            return
+            return True
+        previous = sw.name, sw.tags, sw.notes
         sw.name, sw.tags, sw.notes = name, tags, notes
-        self.lib.save_project(self.project)
+        try:
+            self.lib.save_project(self.project)
+        except (OSError, ValueError) as exc:
+            sw.name, sw.tags, sw.notes = previous
+            QMessageBox.warning(self, "Save notes", f"Couldn't save your notes: {exc}")
+            return False
         if refresh:
             self._refresh_history(select=sw.id)
+        return True
 
     def _remix(self):
         sw = self._current_swatch()
@@ -1111,7 +1153,11 @@ class EaselWindow(QMainWindow):
             return
         if QMessageBox.question(self, "Delete swatch", f"Delete “{sw.label()}”?") != QMessageBox.Yes:
             return
-        self.lib.delete_swatch(self.project, sw.id)
+        try:
+            self.lib.delete_swatch(self.project, sw.id)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Delete swatch", str(exc))
+            return
         self.current = None
         self._fill_details(None)
         self._refresh_history()
@@ -1122,5 +1168,7 @@ class EaselWindow(QMainWindow):
     def closeEvent(self, event):
         # Name/notes are saved on editingFinished; notes have no such signal, so
         # flush them here rather than lose a sentence typed just before closing.
-        self._save_details()
+        if not self._save_details():
+            event.ignore()
+            return
         super().closeEvent(event)

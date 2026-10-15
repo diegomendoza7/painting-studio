@@ -459,7 +459,7 @@ class ControlsPanel(QWidget):
     # -- signal wiring ------------------------------------------------------------
     def _wire(self):
         for combo in (self.doc_mode, self.medium, self.max_paints, self.shade_mode,
-                      self.harmony, self.card_units, self.tessera_layout):
+                      self.harmony, self.tessera_layout):
             combo.currentIndexChanged.connect(self._emit)
         self.medium.currentIndexChanged.connect(self._update_medium_rule)
         self.doc_mode.currentIndexChanged.connect(self._sync_mode)
@@ -528,7 +528,7 @@ class ControlsPanel(QWidget):
                 sb.setValue(v)
                 sb.blockSignals(False)
         self._card_unit = new
-        # _emit already fired from currentIndexChanged.
+        self._emit()  # Collect the converted dimensions with the new units.
 
     def set_user_presets(self, names):
         """Rebuild the preset combo: Custom, built-ins, then saved user presets."""

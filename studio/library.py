@@ -18,22 +18,26 @@ Three rules keep it trustworthy over months of use:
   palette later doesn't rewrite history; "re-mix" is an explicit action.
 * **Writes are atomic** (temp file + rename), so a crash mid-save can't leave a
   half-written ``project.json`` and lose a painting's history.
-* **Each window writes only its own part.** A project is shared: the Easel owns
-  its swatches, palette and canvas; the document window owns ``document`` (its
-  board / plan / mosaic settings). They can run as separate programs, so every
-  save re-reads the other part from disk rather than writing back a stale copy
-  — otherwise saving in one would silently erase work done in the other.
+* **Independent edits are merged.** Swatches and document settings can change
+  in separate windows; the active palette and canvas are shared. A transaction
+  lock covers each read/modify/write, and edits are merged against the window's
+  saved state so saving notes cannot revert a newer palette or canvas.
 
 Qt-free, so the smoke suite can exercise it against a temp directory.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import uuid
+import threading
+from contextlib import contextmanager
+from copy import deepcopy
+from functools import wraps
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -45,6 +49,17 @@ from .palettes import STARTERS
 from .params import UNIT_IN
 
 SCHEMA = 1
+_LOCKS: dict = {}
+_LOCKS_GUARD = threading.Lock()
+_HELD_LOCKS = threading.local()
+
+
+def _transactional(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._transaction():
+            return method(self, *args, **kwargs)
+    return wrapped
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), "Documents", "Painting Studio")
 
 # iPhone photos; converted to JPEG on import (see ``Library.set_reference``).
@@ -67,6 +82,8 @@ def _atomic_write(path: str, text: str) -> None:
     tmp = f"{path}.tmp-{uuid.uuid4().hex[:6]}"
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
@@ -127,6 +144,7 @@ class Project:
     # None until the project has been saved from there.
     document: Optional[dict] = None
     path: str = ""                   # absolute folder; not serialized
+    _saved: Optional[dict] = field(default=None, repr=False, compare=False)
 
     def swatch(self, sid: str) -> Optional[Swatch]:
         return next((s for s in self.swatches if s.id == sid), None)
@@ -211,7 +229,7 @@ def _project_to_dict(p: Project) -> dict:
 
 
 def _project_from_dict(d: dict, path: str) -> Project:
-    return Project(
+    proj = Project(
         id=d.get("id") or os.path.basename(path),
         name=d.get("name", "Untitled"),
         palette=d.get("palette", ""),
@@ -226,6 +244,45 @@ def _project_from_dict(d: dict, path: str) -> Project:
         document=d.get("document") if isinstance(d.get("document"), dict) else None,
         path=path,
     )
+    proj._saved = deepcopy(d)
+    return proj
+
+
+def _merge_project(current: dict, saved: dict, disk: dict, keep_document: bool) -> dict:
+    """Apply this window's changes while retaining independent changes on disk."""
+    merged = deepcopy(disk)
+    for key, value in current.items():
+        if key in ("document", "swatches", "updated"):
+            continue
+        if value == saved.get(key):
+            continue
+        if disk.get(key) != saved.get(key) and disk.get(key) != value:
+            raise ValueError("This painting changed in another window. Reopen it before saving these edits.")
+        merged[key] = value
+    old = {s["id"]: s for s in saved.get("swatches", [])}
+    now = {s["id"]: s for s in current.get("swatches", [])}
+    other = {s["id"]: deepcopy(s) for s in disk.get("swatches", [])}
+    for sid in old.keys() - now.keys():
+        if sid in other and other[sid] != old[sid]:
+            raise ValueError("This swatch changed in another window. Reopen it before deleting it.")
+        other.pop(sid, None)
+    for sid, sw in now.items():
+        if sid not in old:
+            other[sid] = sw
+        elif sw != old[sid]:
+            if sid not in other:
+                raise ValueError("This swatch was deleted in another window. Reopen the painting.")
+            for key, value in sw.items():
+                if value != old[sid].get(key):
+                    if other[sid].get(key) not in (old[sid].get(key), value):
+                        raise ValueError("This swatch changed in another window. Reopen it before saving these edits.")
+                    other[sid][key] = value
+    order = list(now) + [sid for sid in other if sid not in now]
+    merged["swatches"] = sorted((other[sid] for sid in order if sid in other),
+                                key=lambda s: s.get("created", ""), reverse=True)
+    if not keep_document:
+        merged["document"] = current.get("document")
+    return merged
 
 
 # --- the library ----------------------------------------------------------------
@@ -237,11 +294,45 @@ class Library:
         self.projects_dir = os.path.join(root, "projects")
         os.makedirs(self.projects_dir, exist_ok=True)
         self._palettes_path = os.path.join(root, "palettes.json")
-        if not os.path.exists(self._palettes_path):
-            self._write_palettes({
-                STARTER_NAMES[m]: NamedPalette(STARTER_NAMES[m], m, paints)
-                for m, paints in STARTERS.items()
-            })
+        with self._transaction():
+            if not os.path.exists(self._palettes_path):
+                self._write_palettes({
+                    STARTER_NAMES[m]: NamedPalette(STARTER_NAMES[m], m, paints)
+                    for m, paints in STARTERS.items()
+                })
+
+    @contextmanager
+    def _transaction(self):
+        """Serialize complete read/modify/write operations across windows/processes."""
+        key = os.path.realpath(self.root)
+        with _LOCKS_GUARD:
+            lock = _LOCKS.setdefault(key, threading.RLock())
+        with lock:
+            held = getattr(_HELD_LOCKS, "roots", set())
+            if key in held:
+                yield
+                return
+            with open(os.path.join(self.root, ".library.lock"), "a+b") as fh:
+                if os.name == "nt":
+                    import msvcrt
+                    if os.fstat(fh.fileno()).st_size == 0:
+                        fh.write(b"\0")
+                        fh.flush()
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                _HELD_LOCKS.roots = held | {key}
+                try:
+                    yield
+                finally:
+                    _HELD_LOCKS.roots = held
+                    if os.name == "nt":
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     # -- palettes -----------------------------------------------------------------
     def _read_palettes_raw(self) -> dict:
@@ -279,11 +370,13 @@ class Library:
         }
         _atomic_write(self._palettes_path, json.dumps(data, indent=2))
 
+    @_transactional
     def save_palette(self, pal: NamedPalette) -> None:
         pals = self.palettes()
         pals[pal.name] = pal
         self._write_palettes(pals)
 
+    @_transactional
     def delete_palette(self, name: str) -> None:
         pals = self.palettes()
         pals.pop(name, None)
@@ -299,6 +392,7 @@ class Library:
         name = data.get("default", "")
         return name if name in (data.get("palettes") or {}) else ""
 
+    @_transactional
     def set_default_palette(self, name: str) -> None:
         self._write_palettes(self.palettes(), default=name)
 
@@ -319,6 +413,7 @@ class Library:
         with open(os.path.join(path, "project.json"), encoding="utf-8") as fh:
             return _project_from_dict(json.load(fh), path)
 
+    @_transactional
     def create_project(
         self,
         name: str,
@@ -340,6 +435,7 @@ class Library:
         self.save_project(proj)
         return proj
 
+    @_transactional
     def save_project(self, proj: Project, keep_document: bool = True) -> None:
         """Write a project. ``document`` is taken from disk unless this save owns it.
 
@@ -354,19 +450,45 @@ class Library:
             try:
                 with open(path, encoding="utf-8") as fh:
                     disk = json.load(fh) or {}
-            except (OSError, ValueError):
-                disk = {}
-        if keep_document and disk:
-            proj.document = disk.get("document") if isinstance(disk.get("document"), dict) else None
+            except (OSError, ValueError) as exc:
+                raise ValueError("The saved painting could not be read; it was left unchanged.") from exc
         on_disk_ref = disk.get("reference", "")
         if (proj.reference and on_disk_ref and on_disk_ref != proj.reference
                 and not os.path.isfile(os.path.join(proj.path, proj.reference))
                 and os.path.isfile(os.path.join(proj.path, on_disk_ref))):
             proj.reference = on_disk_ref
-        proj.updated = _now()
-        _atomic_write(path, json.dumps(_project_to_dict(proj), indent=2))
+        payload = _project_to_dict(proj)
+        if disk and proj._saved is not None:
+            payload = _merge_project(payload, proj._saved, disk, keep_document)
+        elif keep_document and disk:
+            payload["document"] = disk.get("document")
+        # Shared project edits from the Easel also update the saved document.
+        if keep_document and isinstance(payload.get("document"), dict):
+            doc = deepcopy(payload["document"])
+            params = doc.get("params")
+            if isinstance(params, dict):
+                if payload.get("palette") != disk.get("palette"):
+                    pal = self.palette(payload["palette"])
+                    if pal is not None:
+                        params.update(palette=[paint_to_dict(p) for p in pal.paints], medium=pal.medium)
+                if any(payload.get(k) != disk.get(k) for k in ("canvas_w", "canvas_h", "units")):
+                    params.update(paper_w=payload["canvas_w"], paper_h=payload["canvas_h"],
+                                  canvas_units=payload["units"])
+            payload["document"] = doc
+        payload["updated"] = _now()
+        _atomic_write(path, json.dumps(payload, indent=2))
+        fresh = _project_from_dict(payload, proj.path)
+        # Preserve references held by the UI while adopting independently saved edits.
+        existing = {s.id: s for s in proj.swatches}
+        for i, sw in enumerate(fresh.swatches):
+            if sw.id in existing:
+                existing[sw.id].__dict__.update(sw.__dict__)
+                fresh.swatches[i] = existing[sw.id]
+        proj.__dict__.update(fresh.__dict__)
 
-    def save_document(self, pid: str, document: dict, reference_src: Optional[str] = None) -> Project:
+    @_transactional
+    def save_document(self, pid: str, document: dict, reference_src: Optional[str] = None,
+                      previous_document: Optional[dict] = None) -> Project:
         """Save the document window's part of a project, leaving the Easel's alone.
 
         Loads the project fresh from disk first, so swatches the Easel made since
@@ -374,12 +496,52 @@ class Library:
         reference photo (copied in) when the document window opened a new one.
         """
         proj = self.load_project(pid)
+        document = deepcopy(document)
+        params = document.get("params") or {}
+        previous = (previous_document or {}).get("params") or {}
+        if previous and "palette" in params and "palette" in previous:
+            from .session import params_from_dict
+            requested, baseline = params_from_dict(params), params_from_dict(previous)
+            current = self.palette(proj.palette)
+            if current is not None:
+                wanted = requested.palette, requested.effective_medium()
+                before = baseline.palette, baseline.effective_medium()
+                on_disk = current.paints, current.medium
+                if wanted == before:
+                    params.update(palette=[paint_to_dict(p) for p in current.paints],
+                                  medium=current.medium)
+                elif on_disk != before and on_disk != wanted:
+                    raise ValueError("The active palette changed in another window. Reopen before replacing it.")
+        if previous and all(k in params and k in previous for k in ("paper_w", "paper_h", "canvas_units")):
+            keys = ("paper_w", "paper_h", "canvas_units")
+            wanted = tuple(params[k] for k in keys)
+            before = tuple(previous[k] for k in keys)
+            on_disk = proj.canvas_w, proj.canvas_h, proj.units
+            if wanted == before:
+                params.update(paper_w=proj.canvas_w, paper_h=proj.canvas_h, canvas_units=proj.units)
+            elif on_disk != before and on_disk != wanted:
+                raise ValueError("The canvas size changed in another window. Reopen before replacing it.")
+        proj.document = document
+        if "palette" in params:
+            from .session import params_from_dict
+            settings = params_from_dict(params)
+            medium = settings.effective_medium()
+            matching = next((p for p in self.palettes().values()
+                             if p.paints == settings.palette and p.medium == medium), None)
+            if matching is None:
+                name = f"{proj.name} — palette ({proj.id})"
+                matching = NamedPalette(name, medium, settings.palette)
+                self.save_palette(matching)
+            proj.palette = matching.name
+        if "paper_w" in params and "paper_h" in params:
+            proj.canvas_w, proj.canvas_h = float(params["paper_w"]), float(params["paper_h"])
+            proj.units = params.get("canvas_units", proj.units)
         if reference_src:
             self.set_reference(proj, reference_src, save=False)
-        proj.document = document
         self.save_project(proj, keep_document=False)
         return proj
 
+    @_transactional
     def duplicate_project(self, pid: str, name: str) -> Project:
         """A full copy of a project under a new name — what Save As does."""
         src = os.path.join(self.projects_dir, pid)
@@ -387,17 +549,20 @@ class Library:
         dst = os.path.join(self.projects_dir, new_id)
         shutil.copytree(src, dst)
         proj = self.load_project(new_id)
+        proj._saved = None  # A new identity, not an edit to the copied project's identity.
         proj.id, proj.name, proj.path = new_id, name.strip() or "Untitled", dst
         proj.created = _now()
         self.save_project(proj)
         return proj
 
+    @_transactional
     def delete_project(self, pid: str) -> None:
         path = os.path.join(self.projects_dir, pid)
         # Only ever remove a folder that is really one of ours.
         if os.path.isfile(os.path.join(path, "project.json")):
             shutil.rmtree(path)
 
+    @_transactional
     def set_reference(self, proj: Project, src: str, save: bool = True) -> str:
         """Copy a photo into the project as its reference (replacing any old one).
 
@@ -436,6 +601,7 @@ class Library:
         return path if os.path.isfile(path) else None
 
     # -- swatches -----------------------------------------------------------------------
+    @_transactional
     def add_swatch(self, proj: Project, swatch: Swatch, crop_rgb: Optional[np.ndarray] = None) -> Swatch:
         if not swatch.created:
             swatch.created = _now()
@@ -450,16 +616,27 @@ class Library:
         self.save_project(proj)
         return swatch
 
+    @_transactional
     def delete_swatch(self, proj: Project, sid: str) -> None:
         sw = proj.swatch(sid)
         if sw is None:
             return
+        previous = list(proj.swatches)
+        proj.swatches = [s for s in proj.swatches if s.id != sid]
+        try:
+            self.save_project(proj)
+        except (OSError, ValueError):
+            proj.swatches = previous
+            raise
         if sw.crop:
             crop = os.path.join(proj.path, "crops", sw.crop)
-            if os.path.isfile(crop):
+            try:
                 os.remove(crop)
-        proj.swatches = [s for s in proj.swatches if s.id != sid]
-        self.save_project(proj)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.getLogger(__name__).warning("Could not remove obsolete crop %s", crop,
+                                                    exc_info=True)
 
     def crop_path(self, proj: Project, swatch: Swatch) -> Optional[str]:
         if not swatch.crop:

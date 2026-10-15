@@ -13,7 +13,7 @@ import json
 from dataclasses import asdict, fields
 from typing import Optional
 
-from .models import paint_from_dict, target_from_dict
+from .models import Paint, Target, paint_from_dict, target_from_dict
 from .params import Params
 
 # Bump when the on-disk shape changes incompatibly; a mismatch makes
@@ -38,10 +38,11 @@ def _params_from_jsonable(d: dict) -> Params:
     Unknown keys are dropped so old blobs load forward-compatibly.
     """
     data = {k: v for k, v in d.items() if k in _FIELDS}
-    if isinstance(data.get("palette"), list):
-        data["palette"] = tuple(paint_from_dict(x) for x in data["palette"])
-    if isinstance(data.get("manual_targets"), list):
-        data["manual_targets"] = tuple(target_from_dict(x) for x in data["manual_targets"])
+    if isinstance(data.get("palette"), (list, tuple)):
+        data["palette"] = tuple(x if isinstance(x, Paint) else paint_from_dict(x) for x in data["palette"])
+    if isinstance(data.get("manual_targets"), (list, tuple)):
+        data["manual_targets"] = tuple(x if isinstance(x, Target) else target_from_dict(x)
+                                       for x in data["manual_targets"])
     return Params(**data)
 
 

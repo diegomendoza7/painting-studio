@@ -185,6 +185,15 @@ the Easel's paintings. The photo is copied in on the first save.
 
 ## Run
 
+To update an existing Mac installation without changing your Desktop launchers,
+quit Painting Studio and Easel, extract the new download, and run
+`python3 /path/to/the/extracted/folder/update_mac.py`. The updater reads your
+Desktop `.command` launchers to locate the installation, installs requirements,
+and replaces its app code with a backup. It preserves the installed folder,
+launchers, virtual environments, and other files. It does not touch your saved
+projects in `~/Documents/Painting Studio`. If it cannot identify exactly one
+installation, it stops without replacing any app files.
+
 ```bash
 pip install -r requirements.txt
 python main.py            # documents: board, painting plan, mosaic
@@ -226,6 +235,7 @@ All mixes are estimates — test on scrap before committing.
 
 ```bash
 QT_QPA_PLATFORM=offscreen python tests/test_smoke.py
+QT_QPA_PLATFORM=offscreen python tests/test_reliability.py
 ```
 
 A check-based headless suite: color math against published CIEDE2000 test
@@ -243,6 +253,19 @@ follows the drawing *must* run tangential to the circle — horizontal bands
 could not tell andamento apart from a lattice. Coverage is measured by
 rasterizing the drawn stones, so a regression that reopens bare patches fails
 rather than merely looking wrong.
+
+The reliability suite covers unit conversion, notes navigation and save
+failures, shared palette/canvas settings, competing saves from separate
+processes, source transitions, pending exports, and safe closing during a long
+render. A selected reference becomes part of the project after loading succeeds;
+wait for it to finish loading before Save or Save As. Exports are enabled for the
+completed current document. Closing waits for active work without blocking the UI.
+
+Saved documents and the Easel use the project's active named palette and canvas
+dimensions. Saving custom document paints creates a project palette when needed;
+historical swatches retain the recipes they were originally mixed with. Shared
+changes are preserved during independent saves, and conflicting edits request
+reopening the painting rather than silently replacing the other window's work.
 
 ## License note
 
